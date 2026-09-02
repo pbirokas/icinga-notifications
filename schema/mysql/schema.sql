@@ -279,14 +279,12 @@ CREATE TABLE source (
 CREATE INDEX idx_source_changed_at ON source(changed_at);
 
 CREATE TABLE object (
-    id binary(32) NOT NULL, -- SHA256 of identifying tags and the source.id
-    source_id bigint NOT NULL,
+    id binary(32) NOT NULL, -- SHA256 of identifying tags.
     name text NOT NULL,
 
     url text,
 
-    CONSTRAINT pk_object PRIMARY KEY (id),
-    CONSTRAINT fk_object_source FOREIGN KEY (source_id) REFERENCES source(id)
+    CONSTRAINT pk_object PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 CREATE TABLE object_id_tag (
@@ -298,19 +296,27 @@ CREATE TABLE object_id_tag (
     CONSTRAINT fk_object_id_tag_object FOREIGN KEY (object_id) REFERENCES object(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
+CREATE TABLE object_source (
+    object_id binary(32) NOT NULL,
+    source_id bigint NOT NULL, -- The specific source that the object referenced by object_id is associated with.
+
+    CONSTRAINT pk_object_source PRIMARY KEY (object_id, source_id),
+    CONSTRAINT fk_object_source_object FOREIGN KEY (object_id) REFERENCES object(id),
+    CONSTRAINT fk_object_source_source FOREIGN KEY (source_id) REFERENCES source(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
 CREATE TABLE rule (
     id bigint NOT NULL AUTO_INCREMENT,
     name text NOT NULL COLLATE utf8mb4_unicode_ci,
     timeperiod_id bigint,
-    source_id bigint NOT NULL, -- the source this rule belongs to
     object_filter text,
+    source_type text NOT NULL, -- Which source type this rule is associated with, e.g. 'icinga2', 'custom', ...
 
     changed_at bigint NOT NULL,
     deleted enum('n', 'y') NOT NULL DEFAULT 'n',
 
     CONSTRAINT pk_rule PRIMARY KEY (id),
-    CONSTRAINT fk_rule_timeperiod FOREIGN KEY (timeperiod_id) REFERENCES timeperiod(id),
-    CONSTRAINT fk_rule_source FOREIGN KEY (source_id) REFERENCES source(id)
+    CONSTRAINT fk_rule_timeperiod FOREIGN KEY (timeperiod_id) REFERENCES timeperiod(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 CREATE INDEX idx_rule_changed_at ON rule(changed_at);
@@ -460,23 +466,27 @@ CREATE TABLE incident_history (
 
 CREATE INDEX idx_incident_history_time_type ON incident_history(time, type) COMMENT 'Incident History ordered by time/type';
 
-CREATE TABLE event_queue (
-    id binary(32) NOT NULL, -- SHA256 of JSON representation.
+CREATE TABLE job_queue (
+    id binary(32) NOT NULL, -- SHA256 of JSON representation of the envelope.
     last_update bigint NOT NULL,
-
-    json longtext NOT NULL,
-    event_time bigint NOT NULL,
-    object_id binary(32) NOT NULL, -- No foreign key, object might not exist at this point.
-
-    user_agent varchar(255) NOT NULL, -- From submitting client; allows migrations after upgrades.
     state smallint NOT NULL DEFAULT 0, -- pending (0), processing (1), done (2), or error (64).
+    envelope longtext NOT NULL,
 
-    CONSTRAINT pk_event_queue PRIMARY KEY (id)
+    CONSTRAINT pk_job_queue PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE INDEX idx_event_queue_last_update ON event_queue (last_update);
-CREATE INDEX idx_event_queue_last_update_state ON event_queue (last_update, state);
-CREATE INDEX idx_event_queue_state_object_id ON event_queue (state, object_id);
+-- These indices are used to speed up the cleanup queries by last_update and state.
+CREATE INDEX idx_job_queue_last_update ON job_queue (last_update);
+CREATE INDEX idx_job_queue_last_update_state ON job_queue (last_update, state);
+
+CREATE TABLE job_processing_lock (
+    object_id binary(32) NOT NULL, -- No foreign key, object might not exist at this point.
+    job_queue_id binary(32) NOT NULL, -- references job_queue.id
+
+    CONSTRAINT pk_job_processing_lock PRIMARY KEY (object_id),
+    CONSTRAINT fk_job_processing_lock_job_queue FOREIGN KEY (job_queue_id) REFERENCES job_queue(id),
+    CONSTRAINT uk_job_processing_lock_job_queue_id UNIQUE (job_queue_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 CREATE TABLE browser_session (
     php_session_id varchar(256) NOT NULL,

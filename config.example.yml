@@ -1,6 +1,3 @@
-# The base Icinga Web 2 URL being used as the base URL for all object, notification and event URLs.
-icingaweb2_url: http://localhost/icingaweb2/
-
 # Directory containing all executable Icinga Notifications channel plugins.
 # By default, all of Icinga Notifications built-in channel plugins are installed in the directory below.
 #channels_dir: /usr/libexec/icinga-notifications/channels
@@ -131,7 +128,7 @@ retention:
     #channel:
     #database:
     #incident:
-    #event-queue:
+    #job-queue:
     #listener:
     #retention:
     #runtime-updates:

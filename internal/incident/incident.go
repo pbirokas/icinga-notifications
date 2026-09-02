@@ -13,7 +13,6 @@ import (
 	"github.com/icinga/icinga-notifications/internal/channel"
 	"github.com/icinga/icinga-notifications/internal/config"
 	"github.com/icinga/icinga-notifications/internal/contracts"
-	"github.com/icinga/icinga-notifications/internal/daemon"
 	"github.com/icinga/icinga-notifications/internal/event"
 	"github.com/icinga/icinga-notifications/internal/object"
 	"github.com/icinga/icinga-notifications/internal/recipient"
@@ -131,7 +130,7 @@ func (i *Incident) ProcessEvent(ctx context.Context, ev *event.Event) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	i.ObjectID = object.ID(ev.SourceId, ev.Tags)
+	i.ObjectID = object.ID(ev.Tags)
 	if err := i.RestoreState(ctx, tx, true); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		i.logger.Errorw("Failed to restore incident row from the database", zap.Error(err))
 		return fmt.Errorf("cannot restore incident state: %w", err)
@@ -473,11 +472,18 @@ func (i *Incident) applyMatchingRules(ctx context.Context, tx *sqlx.Tx, ev *even
 		return nil
 	}
 
-	for _, id := range src.RuleIDs() {
+	for id := range src.RuleIDs() {
 		if _, ok := i.Rules[id]; !ok {
 			r, ok := i.runtimeConfig.Rules[id]
 			if !ok {
 				i.logger.Errorw("BUG: source references unknown event rule", zap.Object("source", src))
+				continue
+			}
+
+			if r.SourceType != src.Type {
+				i.logger.Errorw("BUG: source references event rule with mismatching source type",
+					zap.Object("source", src),
+					zap.Object("rule", r))
 				continue
 			}
 
@@ -674,7 +680,7 @@ func (i *Incident) notifyContact(
 ) error {
 	i.logger.Infof("Notifying contact %q via %q of type %q", contact.FullName, ch.Name, ch.Type)
 
-	if err := ch.Notify(contact, i, obj, ev, daemon.Config().IcingaWeb2UrlParsed); err != nil {
+	if err := ch.Notify(contact, i, obj, ev); err != nil {
 		i.logger.Errorw("Failed to send notification via channel plugin", zap.String("type", ch.Type), zap.Error(err))
 		return err
 	}
