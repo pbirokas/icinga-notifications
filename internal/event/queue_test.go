@@ -7,11 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/icinga/icinga-go-library/database"
 	baseEv "github.com/icinga/icinga-go-library/notifications/event"
 	"github.com/icinga/icinga-go-library/types"
@@ -25,18 +27,51 @@ import (
 func TestQueue(t *testing.T) {
 	t.Parallel()
 
+	testutils.SkipTestIfDBConfigIsMissing(t)
 	daemon.InjectTestConfig(func(configFile *daemon.ConfigFile) { testutils.LoadTestConfig(t, configFile) })
 
 	db := testutils.GetTestDB(t.Context(), t, &daemon.Config().Database)
 	logs := testutils.GetTestLogging(t)
 
-	t.Run("Enqueue", func(t *testing.T) {
-		t.Cleanup(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			cleanupDB(ctx, t, db)
-		})
+	cleaner := testutils.NewDBCleaner("job_processing_lock", "job_queue")
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cleaner.Clean(ctx, t, db)
+	})
 
+	var queueIDs []types.UUID
+	var queueIDsMu sync.Mutex
+	makeUUIDInFilter := func(idColumn string) string {
+		queueIDsMu.Lock()
+		defer queueIDsMu.Unlock()
+
+		if len(queueIDs) == 0 {
+			return ""
+		}
+		return fmt.Sprintf(`%s IN (%s)`, idColumn, func() string {
+			var b strings.Builder
+			for i, id := range queueIDs {
+				if i > 0 {
+					b.WriteRune(',')
+				}
+				if db.DriverName() == database.PostgreSQL {
+					b.WriteRune('\'')
+					b.WriteString(id.String())
+					b.WriteRune('\'')
+				} else {
+					b.WriteString("UNHEX('")
+					b.WriteString(hex.EncodeToString(id.UUID[:]))
+					b.WriteString("')")
+				}
+			}
+			return b.String()
+		}())
+	}
+	cleaner.AddLazy("job_queue", func(context.Context) string { return makeUUIDInFilter("id") })
+	cleaner.AddLazy("job_processing_lock", func(context.Context) string { return makeUUIDInFilter("job_queue_id") })
+
+	t.Run("Enqueue", func(t *testing.T) {
 		assertJobCount := func(expected int) {
 			var count int
 			err := db.GetContext(t.Context(), &count, "SELECT COUNT(*) FROM job_queue")
@@ -45,43 +80,50 @@ func TestQueue(t *testing.T) {
 		}
 		assertJobCount(0)
 
-		require.NoError(t, Enqueue(t.Context(), db, makeEvent(t)))
+		require.NoError(t, Enqueue(t.Context(), db, makeEvent(t, &queueIDs, &queueIDsMu)))
 		assertJobCount(1)
 
-		ev := makeEvent(t)
+		ev := makeEvent(t, &queueIDs, &queueIDsMu)
 		require.NoError(t, Enqueue(t.Context(), db, ev))
 		assertJobCount(2)
 
 		require.NoError(t, Enqueue(t.Context(), db, ev))
 		assertJobCount(2) // Duplicate event should not increase count
+		ev.ID = types.MakeUUID(uuid.Nil, types.TransformNilUUIDToNull)
 
-		require.NoError(t, Enqueue(t.Context(), db, makeEvent(t)))
-		assertJobCount(3) // Different event with same ID but different body should be enqueued.
+		require.NoError(t, Enqueue(t.Context(), db, ev))
+		assertJobCount(3) // Duplicate
+
+		queueIDsMu.Lock()
+		queueIDs = append(queueIDs, ev.ID)
+		queueIDsMu.Unlock()
+
+		require.NoError(t, Enqueue(t.Context(), db, ev))
+		assertJobCount(3) // Duplicate
+
+		require.NoError(t, Enqueue(t.Context(), db, makeEvent(t, &queueIDs, &queueIDsMu)))
+		assertJobCount(4) // Different event with same ID but different body should be enqueued.
 
 		var wg sync.WaitGroup // Test concurrent enqueuing
 		for range 16 {
 			wg.Go(func() {
 				for range 10 {
-					require.NoError(t, Enqueue(t.Context(), db, makeEvent(t)))
+					require.NoError(t, Enqueue(t.Context(), db, makeEvent(t, &queueIDs, &queueIDsMu)))
 				}
 			})
 		}
 		wg.Wait()
-		assertJobCount(163) // 3 from before + 16*10 = 163
+		assertJobCount(164) // 4 from before + 16*10 = 164
 	})
 
 	t.Run("Dequeue", func(t *testing.T) {
-		t.Cleanup(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			cleanupDB(ctx, t, db)
-		})
+		t.Parallel()
 
 		producerCtx, producerCtxCancel := context.WithCancel(t.Context())
 		defer producerCtxCancel()
 		go func() {
 			for producerCtx.Err() == nil {
-				err := Enqueue(producerCtx, db, makeEvent(t))
+				err := Enqueue(producerCtx, db, makeEvent(t, &queueIDs, &queueIDsMu))
 				if producerCtx.Err() == nil {
 					require.NoError(t, err)
 				}
@@ -134,7 +176,7 @@ func TestQueue(t *testing.T) {
 		failEvM := make(map[string]struct{})
 
 		wg.Go(func() {
-			ticker := time.NewTicker(time.Second)
+			ticker := time.NewTicker(5 * time.Second)
 
 			for {
 				select {
@@ -143,7 +185,7 @@ func TestQueue(t *testing.T) {
 						continue
 					}
 					t.Logf("Processed %d events so far. Successful: %d, Failed: %d", counter.Load(), len(successEvM), len(failEvM))
-					consumerCtxCancel() // Stop processing queue after 1 second of inactivity
+					consumerCtxCancel() // Stop processing queue after 5 second of inactivity
 					return
 
 				case ev := <-successfulEventJobs:
@@ -155,7 +197,7 @@ func TestQueue(t *testing.T) {
 					assert.False(t, failExits, "event %s processed successfully after failing", qID)
 
 					successEvM[qID] = struct{}{}
-					ticker.Reset(time.Second)
+					ticker.Reset(5 * time.Second)
 
 				case ev := <-failedEventJobs:
 					qID := makeQueueID(t, ev)
@@ -166,7 +208,7 @@ func TestQueue(t *testing.T) {
 					assert.False(t, failExits, "event %s failed more than once", qID)
 
 					failEvM[qID] = struct{}{}
-					ticker.Reset(time.Second)
+					ticker.Reset(5 * time.Second)
 				}
 			}
 		})
@@ -210,34 +252,23 @@ func makeQueueID(t *testing.T, ev *Event) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// makeEvent creates a new Event and returns it.
-func makeEvent(t *testing.T) *Event {
-	return &Event{
+// makeEvent creates a new Event with random tags and a unique ID, and appends the ID to the provided slice.
+func makeEvent(t *testing.T, ids *[]types.UUID, mu *sync.Mutex) *Event {
+	ev := &Event{
 		Time: time.Now().Truncate(time.Second),
-		Event: baseEv.Event{
-			ID:   "test-event-id",
-			Name: "Test Event",
-			Tags: map[string]string{
-				"host":    testutils.MakeRandomString(t),
-				"service": testutils.MakeRandomString(t),
-			},
-			Severity: baseEv.SeverityCrit,
-			Message:  "You're gonna have a bad time.",
+		ID:   types.MakeUUID(uuid.New()),
+		Name: "Test Event",
+		Tags: map[string]string{
+			"host":    testutils.MakeRandomString(t),
+			"service": testutils.MakeRandomString(t),
 		},
+		Severity: baseEv.SeverityCritical,
+		Summary:  "Oops",
+		Message:  "You're gonna have a bad time.",
 	}
-}
 
-// cleanupDB removes all test data from the database.
-func cleanupDB(ctx context.Context, t *testing.T, db *database.DB) {
-	switch db.DriverName() {
-	case database.PostgreSQL, database.MySQL:
-		tables := []string{
-			"job_processing_lock",
-			"job_queue",
-		}
-		for _, table := range tables {
-			_, err := db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s", table))
-			require.NoError(t, err)
-		}
-	}
+	mu.Lock()
+	defer mu.Unlock()
+	*ids = append(*ids, ev.ID)
+	return ev
 }

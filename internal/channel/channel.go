@@ -2,15 +2,19 @@ package channel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
+	"unicode/utf8"
 
+	"github.com/icinga/icinga-go-library/backoff"
 	"github.com/icinga/icinga-go-library/database"
 	"github.com/icinga/icinga-go-library/notifications/jsonrpc"
 	"github.com/icinga/icinga-go-library/notifications/plugin"
+	"github.com/icinga/icinga-go-library/retry"
 	"github.com/icinga/icinga-go-library/types"
 	"github.com/icinga/icinga-notifications/internal/config/baseconf"
-	"github.com/icinga/icinga-notifications/internal/contracts"
 	"github.com/icinga/icinga-notifications/internal/event"
 	"github.com/icinga/icinga-notifications/internal/object"
 	"github.com/icinga/icinga-notifications/internal/recipient"
@@ -31,6 +35,8 @@ type Channel struct {
 	Name         string     `db:"name"`
 	Type         string     `db:"type"`
 	Config       string     `db:"config" json:"-"` // excluded from JSON config dump as this may contain sensitive information
+
+	ValidationResult types.String `db:"validation_result" json:"-"` // excluded from JSON dump for the same reason as Config.
 
 	Logger *zap.SugaredLogger `db:"-"`
 	db     *database.DB
@@ -57,8 +63,9 @@ func (c *Channel) IncrementalInitAndValidate() error {
 
 // newConfig helps to store the channel's updated properties
 type newConfig struct {
-	ctype  string
-	config string
+	ctype            string
+	config           string
+	validationResult types.String
 }
 
 // Start initializes the channel and starts the plugin control loop in a separate goroutine.
@@ -74,23 +81,35 @@ func (c *Channel) Start(ctx context.Context, db *database.DB, logger *zap.Sugare
 	c.pluginCtx, c.pluginCtxCancel = context.WithCancelCause(ctx)
 
 	// #nosec G118 -- The goroutine uses a background ctx with timeout after c.pluginCtx is canceled to perform a DB cleanup.
-	go c.pluginControlLoop(newConfig{c.Type, c.Config})
+	go c.pluginControlLoop(newConfig{c.Type, c.Config, c.ValidationResult})
 }
 
 // instantiatePluginSupervisor initializes a new pluginSupervisor for the channel's plugin type and configuration.
-func (c *Channel) instantiatePluginSupervisor(cType string, config string) *pluginSupervisor {
+func (c *Channel) instantiatePluginSupervisor(conf newConfig) *pluginSupervisor {
 	c.Logger.Debug("Initializing channel plugin")
 
-	p, err := newPluginSupervisor(c.pluginCtx, c.db, c.Logger, cType, c.ID)
+	persistError := func(err error) {
+		if rpcErr, ok := errors.AsType[*jsonrpc.Error](err); ok {
+			c.persistValidationError(c.pluginCtx, rpcErr.Message)
+		} else {
+			c.persistValidationError(c.pluginCtx, err.Error())
+		}
+	}
+
+	p, err := newPluginSupervisor(c.pluginCtx, c.db, c.Logger, conf.ctype, c.ID)
 	if err != nil {
 		c.Logger.Errorw("Failed to initialize channel plugin", zap.Error(err))
+		persistError(err)
 		return nil
 	}
 
-	if err := p.SetConfig(c.pluginCtx, config); err != nil {
+	if err := p.SetConfig(c.pluginCtx, conf.config); err != nil {
 		c.Logger.Errorw("Failed to set channel plugin config, terminating the plugin", zap.Error(err))
 		p.Stop()
+		persistError(err)
 		return nil
+	} else if conf.validationResult.Valid {
+		c.persistValidationError(c.pluginCtx, "")
 	}
 
 	p.logger.Info("Successfully started channel plugin")
@@ -122,7 +141,7 @@ func (c *Channel) pluginControlLoop(currentConfig newConfig) {
 
 	for {
 		if current == nil {
-			current = c.instantiatePluginSupervisor(currentConfig.ctype, currentConfig.config)
+			current = c.instantiatePluginSupervisor(currentConfig)
 		}
 
 		select {
@@ -152,12 +171,15 @@ func (c *Channel) pluginControlLoop(currentConfig newConfig) {
 					// If we got a JSON-RPC error, then it's because the plugin rejected the new config for some
 					// reason, so we can just keep the plugin running with the old config. Otherwise, the plugin is
 					// probably already gone, so call stopReset() to clean up and prepare for a new plugin instance.
-					if _, ok := errors.AsType[*jsonrpc.Error](err); !ok {
+					if rpcErr, ok := errors.AsType[*jsonrpc.Error](err); !ok {
 						c.Logger.Warnw("Failed to reload plugin config, restarting the plugin", zap.Error(err))
 						stopReset()
 					} else {
+						c.persistValidationError(c.pluginCtx, rpcErr.Message)
 						c.Logger.Warnw("Failed to reload plugin config, continuing with the old config", zap.Error(err))
 					}
+				} else if newConf.validationResult.Valid {
+					c.persistValidationError(c.pluginCtx, "")
 				}
 			} else {
 				stopReset()
@@ -167,8 +189,8 @@ func (c *Channel) pluginControlLoop(currentConfig newConfig) {
 						zap.String("new_type", newConf.ctype))
 
 					// If the plugin type has changed, we need to clean up the plugin state in the database,
-					// as it's no longer relevant for the new plugin type. It'll will the query internally
-					// for 5m before giving up, so we don't need to retry here.
+					// as it's no longer relevant for the new plugin type. It'll retry the query internally
+					// for 10s before giving up, and any leftovers will be cleaned up by the retention policy.
 					if err := deleteByChannelID(c.pluginCtx, c.db, c.ID); err != nil {
 						c.Logger.Warnw("Failed to clean up channel plugin state after plugin type change",
 							zap.String("old_type", currentConfig.ctype),
@@ -209,41 +231,165 @@ func (c *Channel) Stop(chDeleted bool) {
 	}
 }
 
-// Restart signals to restart the channel plugin with the updated channel config
+// Restart signals to restart the channel plugin with the updated channel config.
 func (c *Channel) Restart(logger *zap.SugaredLogger) {
 	c.Logger = logger.With(zap.Object("channel", c))
 	c.Logger.Info("Restarting the channel plugin due to a config change")
-	c.restartCh <- newConfig{c.Type, c.Config}
+	c.restartCh <- newConfig{c.Type, c.Config, c.ValidationResult}
 }
 
-// Notify prepares and sends the notification request, returns a non-error on fails, nil on success
-func (c *Channel) Notify(contact *recipient.Contact, i contracts.Incident, o *object.Object, ev *event.Event) error {
+// Notify sends a notification about the given incident, object and event to the contact via this channel's plugin.
+//
+// Only the contact's addresses matching the plugin type are passed to the plugin. If an incident is given and the
+// contact has at least one such address, the channel state for this channel, incident and contact is looked up
+// and included in the request, so the plugin can e.g. reply to a previously sent message.
+//
+// If the plugin returns a valid state for a non-recovered incident, it is persisted for subsequent notifications.
+// Failures in any of these state operations are logged but don't fail the notification, unless ctx or the plugin
+// context has been canceled.
+//
+// The provided ctx bounds the whole operation. Canceling it aborts any pending database operation and the RPC call.
+//
+// It returns the plugin's delivery result (maybe nil) on success, or an error if the notification couldn't be sent.
+func (c *Channel) Notify(
+	ctx context.Context,
+	contact *recipient.Contact,
+	i *plugin.Incident,
+	o *object.Object,
+	ev *event.Event,
+	summary string,
+	body string,
+	incidentID int64,
+) (*plugin.DeliveryResult, error) {
 	p := c.getPlugin()
 	if p == nil {
-		return errors.New("plugin could not be started")
+		return nil, errors.New("plugin could not be started")
 	}
 
-	contactStruct := &plugin.Contact{FullName: contact.FullName}
+	pc := &plugin.Contact{FullName: contact.FullName}
 	for _, addr := range contact.Addresses {
-		contactStruct.Addresses = append(contactStruct.Addresses, &plugin.Address{Type: addr.Type, Address: addr.Address})
+		// Not every plugin needs to know about every address that a contact has, so we filter
+		// the addresses by type to only include those that are relevant for the plugin.
+		if addr.Type != p.pluginType {
+			continue
+		}
+		pc.Addresses = append(pc.Addresses, &plugin.Address{Type: addr.Type, Address: addr.Address})
 	}
 
-	req := &plugin.NotificationRequest{
-		Contact: contactStruct,
-		Object: &plugin.Object{
-			Name: o.DisplayName(),
-			Url:  ev.URL,
-			Tags: o.Tags,
-		},
-		Incident: &plugin.Incident{
-			Id:       i.ID(),
-			Severity: i.IncidentSeverity(),
-		},
-		Event: &plugin.Event{
-			Time:    ev.Time,
-			Message: ev.Message,
-		},
+	// Abort the RPC call when either the plugin is stopped or ctx is done, whichever comes first.
+	rpcCtx, cancel := context.WithCancelCause(p.ctx)
+	stopAfterFunc := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	defer stopAfterFunc()
+	defer cancel(nil)
+
+	var state plugin.State
+	if i != nil {
+		state = plugin.State{Key: p.composeStateKey(pc, incidentID)}
+		if !state.Key.IsZero() {
+			s, err := getStateByKey(rpcCtx, p.db, state.Key)
+			if err != nil && rpcCtx.Err() != nil {
+				return nil, err
+			} else if err != nil {
+				// This is not that critical for sending the notification, so don't error out.
+				p.logger.Warnw("Failed to retrieve channel state for incident",
+					zap.Stringer("state_key", state.Key),
+					zap.Int64("incident_id", incidentID),
+					zap.Error(err))
+			}
+			state.Value = s.Value
+		}
+
+		if i.IsRecovered && state.Value == "" {
+			// If the incident is recovering and there is no persistent state for it, we don't need to
+			// send the state key to the plugin, as we won't be able to persist any state for it anyway.
+			state = plugin.State{}
+		}
 	}
 
-	return p.SendNotification(c.pluginCtx, req)
+	var (
+		payload json.RawMessage
+		version plugin.RequestVersion
+	)
+
+	switch v := p.supportedRequestVersions[0]; v {
+	case plugin.RequestVersionV1:
+		version = plugin.RequestVersionV1
+		var err error
+		payload, err = json.Marshal(&plugin.PayloadV1{
+			Contact: pc,
+			Object: &plugin.Object{
+				Name:    o.Name,
+				Url:     ev.URL,
+				Sources: o.Sources,
+				Tags:    o.Tags,
+			},
+			Incident: i,
+			Event: &plugin.Event{
+				Type:    ev.Type,
+				Time:    ev.Time,
+				Message: ev.Message,
+				Summary: ev.Summary,
+			},
+			Summary: summary,
+			Body:    body,
+			State:   state,
+		})
+		if err != nil {
+			return nil, err
+		}
+	default:
+		// Unreachable because the pluginSupervisor constructor already checks for supported versions,
+		// but we keep it here for future-proofing.
+		return nil, fmt.Errorf("unsupported request version %d for plugin type %s", v, p.pluginType)
+	}
+
+	req := &plugin.NotificationRequest{Version: version, Payload: payload}
+	result, err := p.SendNotification(rpcCtx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if i == nil || i.IsRecovered || state.IsZero() || result == nil || result.State.IsZero() {
+		return result, nil
+	}
+
+	if result.State.Key != state.Key {
+		p.logger.Warnw("Received a different state key from the plugin than expected, skipping state persistence",
+			zap.Stringer("expected_state_key", state.Key),
+			zap.Stringer("received_state_key", result.State.Key))
+		return result, nil
+	}
+
+	if result.State.Value == "" || utf8.RuneCountInString(result.State.Value) > maxStateValueLen {
+		p.logger.Warnw("Received an invalid state value from the plugin, skipping state persistence",
+			zap.Stringer("state_key", result.State.Key),
+			zap.Int64("incident_id", incidentID))
+		return result, nil
+	}
+
+	s := &State{ChannelID: p.ChannelID, IncidentID: incidentID, State: result.State}
+	if err := upsertState(rpcCtx, p.db, s); err != nil {
+		p.logger.Warnw("Failed to upsert channel state received from plugin",
+			zap.Stringer("state_key", result.State.Key),
+			zap.Int64("incident_id", incidentID),
+			zap.Error(err))
+	}
+
+	return result, nil
+}
+
+// persistValidationError persists the validation error in the database for the channel.
+//
+// If the validation result is empty, it will be transformed to SQL NULL to indicate that there is no validation error.
+func (c *Channel) persistValidationError(ctx context.Context, result string) {
+	query := `UPDATE channel SET validation_result = ? WHERE id = ?`
+	_ = retry.WithBackoff(
+		ctx,
+		func(ctx context.Context) error {
+			_, err := c.db.ExecContext(ctx, c.db.Rebind(query), types.MakeString(result, types.TransformEmptyStringToNull), c.ID)
+			return err
+		},
+		retry.Retryable,
+		backoff.DefaultBackoff,
+		c.db.GetDefaultRetrySettings())
 }

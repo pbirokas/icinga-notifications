@@ -15,6 +15,7 @@ CREATE TYPE incident_history_event_type AS ENUM (
 );
 CREATE TYPE rotation_type AS ENUM ( '24-7', 'partial', 'multi' );
 CREATE TYPE notification_state_type AS ENUM ( 'suppressed', 'pending', 'sent', 'failed' );
+CREATE TYPE notification_history_state_type AS ENUM ( 'sent', 'failed' );
 
 -- IPL ORM renders SQL queries with LIKE operators for all suggestions in the search bar,
 -- which fails for numeric and enum types on PostgreSQL. Just like in Icinga DB Web.
@@ -30,17 +31,23 @@ CREATE OR REPLACE FUNCTION anynonarrayliketext(anynonarray, text)
     $$;
 CREATE OPERATOR ~~ (LEFTARG=anynonarray, RIGHTARG=text, PROCEDURE=anynonarrayliketext);
 
--- This procedure can be used in upgrade scripts to assert that the schema version in the database matches the
+-- This function can be used in upgrade scripts to assert that the schema version in the database matches the
 -- expected version before applying the upgrade. This is important to prevent users from accidentally skipping
 -- intermediate upgrade scripts, which could lead to an inconsistent database state. For instance, since every
--- upgrade script knows its predecessor's version, we can just do "CALL assert_correct_schema_version('v1.0')"
+-- upgrade script knows its predecessor's version, we can just do "SELECT assert_correct_schema_version('v1.0');"
 -- at the beginning of the 1.x upgrade scripts to ensure that the 1.0 script has been applied before.
-CREATE OR REPLACE PROCEDURE assert_correct_schema_version(expected_version text)
+CREATE OR REPLACE FUNCTION assert_correct_schema_version(expected_version text)
+    RETURNS void
     LANGUAGE plpgsql
+    STABLE
+    STRICT
+    PARALLEL RESTRICTED
 AS $$
 DECLARE
-    actual_version text := (SELECT version FROM notifications_schema ORDER BY timestamp DESC LIMIT 1);
+    actual_version text;
 BEGIN
+    SELECT version INTO actual_version FROM notifications_schema ORDER BY id DESC LIMIT 1;
+
     IF actual_version IS NULL THEN
         RAISE 'Schema version not found in notifications_schema table.';
     ELSIF actual_version != expected_version THEN
@@ -48,7 +55,6 @@ BEGIN
     END IF;
 END;
 $$;
-COMMENT ON PROCEDURE assert_correct_schema_version IS 'Asserts that the schema version in the database matches the expected version and raises an error if not.';
 
 CREATE TABLE available_channel_type (
     type varchar(255) NOT NULL,
@@ -72,6 +78,11 @@ CREATE TABLE channel (
     changed_at bigint NOT NULL,
     deleted boolenum NOT NULL DEFAULT 'n',
 
+    -- The result of the last config validation performed by the channel type implementation.
+    -- This is used to provide feedback to the user about the validity of the channel configuration.
+    -- NULL if the channel has not been validated yet, or the last validation was successful.
+    validation_result text,
+
     CONSTRAINT pk_channel PRIMARY KEY (id),
     CONSTRAINT uk_channel_external_uuid UNIQUE (external_uuid),
     CONSTRAINT fk_channel_available_channel_type FOREIGN KEY (type) REFERENCES available_channel_type(type),
@@ -79,17 +90,6 @@ CREATE TABLE channel (
 );
 
 CREATE INDEX idx_channel_changed_at ON channel(changed_at);
-
-CREATE TABLE channel_state (
-    channel_id bigint NOT NULL,
-    state_key varchar(255) NOT NULL,
-    value varchar(4096) NOT NULL,
-
-    CONSTRAINT pk_channel_state PRIMARY KEY (channel_id, state_key),
-    CONSTRAINT fk_channel_state_channel FOREIGN KEY (channel_id) REFERENCES channel(id)
-);
-
-CREATE INDEX idx_channel_state_channel_id ON channel_state(channel_id);
 
 CREATE TABLE contact (
     id bigserial,
@@ -338,7 +338,8 @@ CREATE TABLE object_source (
 -- Indexes for object_source to speed up the cleanup queries by object id.
 CREATE INDEX idx_object_source_object_id ON object_source(object_id);
 
-CREATE TYPE severity AS ENUM ('ok', 'debug', 'info', 'notice', 'warning', 'err', 'crit', 'alert', 'emerg');
+CREATE TYPE severity AS ENUM ('ok', 'warning', 'error', 'critical');
+CREATE TYPE rule_type AS ENUM ('notification', 'escalation');
 
 CREATE TABLE rule (
     id bigserial,
@@ -346,6 +347,7 @@ CREATE TABLE rule (
     timeperiod_id bigint,
     object_filter text,
     source_type text NOT NULL, -- Which source type this rule is associated with, e.g. 'icinga2', 'custom', ...
+    type rule_type NOT NULL,
 
     changed_at bigint NOT NULL,
     deleted boolenum NOT NULL DEFAULT 'n',
@@ -356,7 +358,7 @@ CREATE TABLE rule (
 
 CREATE INDEX idx_rule_changed_at ON rule(changed_at);
 
-CREATE TABLE rule_escalation (
+CREATE TABLE rule_entry (
     id bigserial,
     rule_id bigint NOT NULL,
     position integer,
@@ -367,23 +369,23 @@ CREATE TABLE rule_escalation (
     changed_at bigint NOT NULL,
     deleted boolenum NOT NULL DEFAULT 'n',
 
-    CONSTRAINT pk_rule_escalation PRIMARY KEY (id),
+    CONSTRAINT pk_rule_entry PRIMARY KEY (id),
 
     -- Each position in an escalation can only be used once.
     -- Column position must be NULLed for deletion via "deleted = 'y'"
-    CONSTRAINT uk_rule_escalation_rule_id_position UNIQUE (rule_id, position),
+    CONSTRAINT uk_rule_entry_rule_id_position UNIQUE (rule_id, position),
 
-    CONSTRAINT ck_rule_escalation_not_both_condition_and_fallback_for CHECK (NOT (condition IS NOT NULL AND fallback_for IS NOT NULL)),
-    CONSTRAINT ck_rule_escalation_non_deleted_needs_position CHECK (deleted = 'y' OR position IS NOT NULL),
-    CONSTRAINT fk_rule_escalation_rule FOREIGN KEY (rule_id) REFERENCES rule(id),
-    CONSTRAINT fk_rule_escalation_rule_escalation FOREIGN KEY (fallback_for) REFERENCES rule_escalation(id)
+    CONSTRAINT ck_rule_entry_not_both_condition_and_fallback_for CHECK (NOT (condition IS NOT NULL AND fallback_for IS NOT NULL)),
+    CONSTRAINT ck_rule_entry_non_deleted_needs_position CHECK (deleted = 'y' OR position IS NOT NULL),
+    CONSTRAINT fk_rule_entry_rule FOREIGN KEY (rule_id) REFERENCES rule(id),
+    CONSTRAINT fk_rule_entry_rule_entry FOREIGN KEY (fallback_for) REFERENCES rule_entry(id)
 );
 
-CREATE INDEX idx_rule_escalation_changed_at ON rule_escalation(changed_at);
+CREATE INDEX idx_rule_entry_changed_at ON rule_entry(changed_at);
 
-CREATE TABLE rule_escalation_recipient (
+CREATE TABLE rule_entry_recipient (
     id bigserial,
-    rule_escalation_id bigint NOT NULL,
+    rule_entry_id bigint NOT NULL,
     contact_id bigint,
     contactgroup_id bigint,
     schedule_id bigint,
@@ -392,35 +394,39 @@ CREATE TABLE rule_escalation_recipient (
     changed_at bigint NOT NULL,
     deleted boolenum NOT NULL DEFAULT 'n',
 
-    CONSTRAINT pk_rule_escalation_recipient PRIMARY KEY (id),
-    CONSTRAINT ck_rule_escalation_recipient_has_exactly_one_recipient CHECK (num_nonnulls(contact_id, contactgroup_id, schedule_id) = 1),
-    CONSTRAINT fk_rule_escalation_recipient_rule_escalation FOREIGN KEY (rule_escalation_id) REFERENCES rule_escalation(id),
-    CONSTRAINT fk_rule_escalation_recipient_contact FOREIGN KEY (contact_id) REFERENCES contact(id),
-    CONSTRAINT fk_rule_escalation_recipient_contactgroup FOREIGN KEY (contactgroup_id) REFERENCES contactgroup(id),
-    CONSTRAINT fk_rule_escalation_recipient_schedule FOREIGN KEY (schedule_id) REFERENCES schedule(id),
-    CONSTRAINT fk_rule_escalation_recipient_channel FOREIGN KEY (channel_id) REFERENCES channel(id)
+    CONSTRAINT pk_rule_entry_recipient PRIMARY KEY (id),
+    CONSTRAINT ck_rule_entry_recipient_has_exactly_one_recipient CHECK (num_nonnulls(contact_id, contactgroup_id, schedule_id) = 1),
+    CONSTRAINT fk_rule_entry_recipient_rule_entry FOREIGN KEY (rule_entry_id) REFERENCES rule_entry(id),
+    CONSTRAINT fk_rule_entry_recipient_contact FOREIGN KEY (contact_id) REFERENCES contact(id),
+    CONSTRAINT fk_rule_entry_recipient_contactgroup FOREIGN KEY (contactgroup_id) REFERENCES contactgroup(id),
+    CONSTRAINT fk_rule_entry_recipient_schedule FOREIGN KEY (schedule_id) REFERENCES schedule(id),
+    CONSTRAINT fk_rule_entry_recipient_channel FOREIGN KEY (channel_id) REFERENCES channel(id)
 );
 
-CREATE INDEX idx_rule_escalation_recipient_changed_at ON rule_escalation_recipient(changed_at);
+CREATE INDEX idx_rule_entry_recipient_changed_at ON rule_entry_recipient(changed_at);
 
 CREATE TABLE incident (
     id bigserial,
     object_id bytea NOT NULL,
+    source_id bigint NOT NULL, -- the source whose event originally opened this incident.
     started_at bigint NOT NULL,
     recovered_at bigint,
     severity severity NOT NULL,
     -- mute_reason indicates whether this incident is currently muted, and its non-null value is mapped to true.
     mute_reason text,
+    summary text NOT NULL, -- contains the latest plugin event summary of the respective object.
     message text, -- contains the latest plugin output of the respective object.
     next_escalation_check_at bigint,
 
     CONSTRAINT pk_incident PRIMARY KEY (id),
-    CONSTRAINT fk_incident_object FOREIGN KEY (object_id) REFERENCES object(id)
+    CONSTRAINT fk_incident_object FOREIGN KEY (object_id) REFERENCES object(id),
+    CONSTRAINT fk_incident_source FOREIGN KEY (source_id) REFERENCES source(id)
 );
 
 -- PostgreSQL doesn't automatically create an index for foreign keys, so we need to do this manually.
 -- This is important for the retention queries, which become quite unusable without an index on object_id.
 CREATE INDEX idx_incident_object_id ON incident(object_id);
+CREATE INDEX idx_incident_source_id ON incident(source_id);
 CREATE INDEX idx_incident_recovered_at ON incident(recovered_at);
 CREATE INDEX idx_incident_object_id_recovered_at ON incident(object_id, recovered_at);
 CREATE INDEX idx_incident_next_escalation_check_at ON incident(next_escalation_check_at);
@@ -435,6 +441,7 @@ CREATE TABLE incident_contact (
     contactgroup_id bigint,
     schedule_id bigint,
     role incident_contact_role NOT NULL,
+    event_types text, -- JSON-Array of event types a subscriber/manager is notified about for incident=false events.
     changed_at bigint NOT NULL, -- used only by Notifications Web to show when the recipients role was last changed.
 
     CONSTRAINT pk_incident_contact PRIMARY KEY (id),
@@ -468,12 +475,12 @@ CREATE INDEX idx_incident_rule_incident_id ON incident_rule(incident_id);
 
 CREATE TABLE incident_rule_escalation_state (
     incident_id bigint NOT NULL,
-    rule_escalation_id bigint NOT NULL,
+    rule_entry_id bigint NOT NULL,
     triggered_at bigint NOT NULL,
 
-    CONSTRAINT pk_incident_rule_escalation_state PRIMARY KEY (incident_id, rule_escalation_id),
+    CONSTRAINT pk_incident_rule_escalation_state PRIMARY KEY (incident_id, rule_entry_id),
     CONSTRAINT fk_incident_rule_escalation_state_incident FOREIGN KEY (incident_id) REFERENCES incident(id),
-    CONSTRAINT fk_incident_rule_escalation_state_rule_escalation FOREIGN KEY (rule_escalation_id) REFERENCES rule_escalation(id)
+    CONSTRAINT fk_incident_rule_escalation_state_rule_entry FOREIGN KEY (rule_entry_id) REFERENCES rule_entry(id)
 );
 
 -- PostgreSQL doesn't automatically create an index for foreign keys, so we need to do this manually.
@@ -482,7 +489,8 @@ CREATE INDEX idx_incident_rule_escalation_state_incident_id ON incident_rule_esc
 CREATE TABLE incident_history (
     id bigserial,
     incident_id bigint NOT NULL,
-    rule_escalation_id bigint,
+    event_id uuid, -- used for external references
+    rule_entry_id bigint,
     contact_id bigint,
     contactgroup_id bigint,
     schedule_id bigint,
@@ -499,9 +507,9 @@ CREATE TABLE incident_history (
     sent_at bigint,
 
     CONSTRAINT pk_incident_history PRIMARY KEY (id),
-    CONSTRAINT fk_incident_history_incident_rule_escalation_state FOREIGN KEY (incident_id, rule_escalation_id) REFERENCES incident_rule_escalation_state(incident_id, rule_escalation_id),
+    CONSTRAINT fk_incident_history_incident_rule_escalation_state FOREIGN KEY (incident_id, rule_entry_id) REFERENCES incident_rule_escalation_state(incident_id, rule_entry_id),
     CONSTRAINT fk_incident_history_incident FOREIGN KEY (incident_id) REFERENCES incident(id),
-    CONSTRAINT fk_incident_history_rule_escalation FOREIGN KEY (rule_escalation_id) REFERENCES rule_escalation(id),
+    CONSTRAINT fk_incident_history_rule_entry FOREIGN KEY (rule_entry_id) REFERENCES rule_entry(id),
     CONSTRAINT fk_incident_history_contact FOREIGN KEY (contact_id) REFERENCES contact(id),
     CONSTRAINT fk_incident_history_contactgroup FOREIGN KEY (contactgroup_id) REFERENCES contactgroup(id),
     CONSTRAINT fk_incident_history_schedule FOREIGN KEY (schedule_id) REFERENCES schedule(id),
@@ -513,9 +521,68 @@ CREATE TABLE incident_history (
 CREATE INDEX idx_incident_history_incident_id ON incident_history(incident_id);
 CREATE INDEX idx_incident_history_time_type ON incident_history(time, type);
 COMMENT ON INDEX idx_incident_history_time_type IS 'Incident History ordered by time/type';
+-- This will be used by the query in the [Incident.RetriggerEscalations] method in icinga-notifications.
+CREATE INDEX idx_incident_history_event_id_incident_id ON incident_history(event_id, incident_id);
+
+-- Created after the incident table because of its foreign key to it.
+CREATE TABLE channel_state (
+    state_key uuid NOT NULL,
+    channel_id bigint NOT NULL,
+    incident_id bigint NOT NULL, -- The incident this state is associated with.
+    value varchar(4096) NOT NULL,
+
+    CONSTRAINT pk_channel_state PRIMARY KEY (state_key),
+    CONSTRAINT fk_channel_state_channel FOREIGN KEY (channel_id) REFERENCES channel(id),
+    CONSTRAINT fk_channel_state_incident FOREIGN KEY (incident_id) REFERENCES incident(id)
+);
+
+CREATE INDEX idx_channel_state_channel_id ON channel_state(channel_id);
+-- This index is required to speed up the "incident" retention query.
+CREATE INDEX idx_channel_state_incident_id ON channel_state(incident_id);
+
+CREATE TABLE notification_history (
+    id bigserial,
+    object_id bytea NOT NULL,
+    event_id uuid NOT NULL,
+    contact_id bigint NOT NULL,
+    contactgroup_id bigint,
+    schedule_id bigint,
+    channel_id bigint NOT NULL,
+    incident_id bigint,
+    event_message text NOT NULL,
+    event_summary text NOT NULL,
+    state notification_history_state_type NOT NULL,
+    triggered_at bigint NOT NULL,
+    incident_closed boolenum NOT NULL DEFAULT 'n', -- Indicates whether the incident was closed at the time of the notification.
+
+    delivery_result text, -- The result of the notification delivery attempt (if any) as a JSON string.
+
+    CONSTRAINT pk_notification_history PRIMARY KEY (id),
+    CONSTRAINT fk_notification_history_object_id FOREIGN KEY (object_id) REFERENCES object(id)
+);
+
+CREATE INDEX idx_notification_history_triggered_at ON notification_history(triggered_at);
+CREATE INDEX idx_notification_history_state_triggered_at ON notification_history(state, triggered_at);
+-- This index is required for the "object" retention query, which becomes quite unusable without it.
+CREATE INDEX idx_notification_history_object_id ON notification_history(object_id);
+
+CREATE TABLE skipped_notification_history (
+    id bigserial,
+    notification_history_id bigint NOT NULL, -- The actual notification due to which the notification was skipped.
+    rule_id bigint NOT NULL,
+    rule_entry_id bigint NOT NULL,
+    contactgroup_id bigint,
+    schedule_id bigint,
+
+    CONSTRAINT pk_skipped_notification_history PRIMARY KEY (id),
+    CONSTRAINT fk_skipped_notification_history_notification_history FOREIGN KEY (notification_history_id) REFERENCES notification_history(id)
+);
+
+-- This index is required for the "notification history" retention query to identify and delete related references.
+CREATE INDEX idx_skipped_notification_history_notification_history_id ON skipped_notification_history(notification_history_id);
 
 CREATE TABLE job_queue (
-    id bytea NOT NULL, -- SHA256 of JSON representation of the envelope.
+    id uuid NOT NULL, -- SHA256 of JSON representation.
     last_update bigint NOT NULL,
     state smallint NOT NULL DEFAULT 0, -- pending (0), processing (1), done (2), or error (64).
     envelope text NOT NULL,
@@ -529,7 +596,7 @@ CREATE INDEX idx_job_queue_last_update_state ON job_queue (last_update, state);
 
 CREATE TABLE job_processing_lock (
     object_id bytea NOT NULL, -- No foreign key, object might not exist at this point.
-    job_queue_id bytea NOT NULL, -- references job_queue.id
+    job_queue_id uuid NOT NULL, -- references job_queue.id
 
     CONSTRAINT pk_job_processing_lock PRIMARY KEY (object_id),
     CONSTRAINT fk_job_processing_lock_job_queue FOREIGN KEY (job_queue_id) REFERENCES job_queue(id),
@@ -558,4 +625,4 @@ CREATE TABLE notifications_schema (
     CONSTRAINT uk_notifications_schema_version UNIQUE (version)
 );
 
-INSERT INTO notifications_schema(version, timestamp) VALUES('v1.0', EXTRACT(EPOCH from NOW()) * 1000);
+INSERT INTO notifications_schema(version, timestamp) VALUES('v1.0.0', EXTRACT(EPOCH from NOW()) * 1000);

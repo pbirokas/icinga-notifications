@@ -9,15 +9,20 @@ sbindir    ?= $(prefix)/sbin
 libexecdir ?= $(prefix)/libexec
 datadir    ?= $(prefix)/share
 sysconfdir ?= /etc
+builddir   ?= build
 
 all: pkg = github.com/icinga/icinga-notifications/internal
 all:
-	mkdir -p build
+	mkdir -p $(builddir)/channels
 	go build \
-		-o build/ \
+		-o $(builddir)/ \
+		-trimpath \
 		-ldflags "-X '$(pkg).LibExecDir=$(libexecdir)' -X '$(pkg).SysConfDir=$(sysconfdir)'" \
 		./cmd/icinga-notifications
-	go build -o build/channels/ ./cmd/channels/...
+	go build \
+		-o $(builddir)/channels \
+		-trimpath \
+		$$(go list ./cmd/channels/... | grep -v '/sleep$$')
 
 test:
 	go test ./...
@@ -27,10 +32,10 @@ install:
 	install -d $(DESTDIR)$(sysconfdir)/icinga-notifications
 	install -m644 config.example.yml $(DESTDIR)$(sysconfdir)/icinga-notifications/config.yml
 	@# dameon
-	install -D build/icinga-notifications $(DESTDIR)$(sbindir)/icinga-notifications
+	install -D $(builddir)/icinga-notifications $(DESTDIR)$(sbindir)/icinga-notifications
 	@# channels
 	install -d $(DESTDIR)$(libexecdir)/icinga-notifications/channels
-	install build/channels/* $(DESTDIR)$(libexecdir)/icinga-notifications/channels/
+	install $(builddir)/channels/* $(DESTDIR)$(libexecdir)/icinga-notifications/channels/
 	@# database schema
 	install -d $(DESTDIR)$(datadir)/icinga-notifications
 	cp -rv --no-dereference schema $(DESTDIR)$(datadir)/icinga-notifications
@@ -38,6 +43,6 @@ install:
 	chmod -R u=rwX,go=rX $(DESTDIR)$(datadir)/icinga-notifications/schema
 
 clean:
-	rm -rf build
+	rm -rf $(builddir)
 
 .PHONY: all test install clean

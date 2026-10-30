@@ -18,7 +18,6 @@ which are then started, configured, and finally used to send notification events
 Icinga Notifications comes with multiple channels out of the box:
 
 * _email_: Email submission via SMTP
-* _rocketchat_: Rocket.Chat
 * _telegram_: Telegram
 * _webhook_: Configurable HTTP/HTTPS queries for your backend
 
@@ -158,16 +157,14 @@ Examples:
 
 ### Available Icinga Notifications Methods
 
-Currently, Icinga Notifications provides the following methods for channel plugins to call:
+Currently, Icinga Notifications provides the following method for channel plugins to call:
 
-| Method               | Description                                                         |
-|----------------------|---------------------------------------------------------------------|
-| channel::Log         | Logs a message to Icinga Notifications' logging system.             |
-| channel::UpsertState | Upserts a channel plugin state in Icinga Notifications' database.   |
-| channel::DeleteState | Deletes a channel plugin state from Icinga Notifications' database. |
+| Method       | Description                                             |
+|--------------|---------------------------------------------------------|
+| channel::Log | Logs a message to Icinga Notifications' logging system. |
 
-Channel plugins can make use of these methods by sending their own JSON-RPC requests to Icinga Notifications.
-Each of these methods is described in detail below, including the expected request and response formats.
+Channel plugins can make use of this method by sending their own JSON-RPC requests to Icinga Notifications.
+It is described in detail below, including the expected request format.
 
 #### Log
 
@@ -210,106 +207,18 @@ This request will result in a log message in Icinga Notifications' logging syste
 Icinga Notifications will also log the channel's `id` and `name`, as well as the process ID of the channel plugin
 process, which can be useful for debugging purposes.
 
-#### UpsertState
-
-The `channel::UpsertState` method allows channel plugins to [upsert their state](#channel-state) in
-Icinga Notifications' database. The request's `params` field must be an array of JSON objects, where each object
-is a [`State`](https://pkg.go.dev/github.com/icinga/icinga-go-library/notifications/plugin#State) entry with the
-fields described in the [Channel State](#channel-state) section. The request's `id` field must be set, as
-Icinga Notifications will respond with a success or error message to each individual request. An example request for
-upserting a channel plugin state is shown below:
-
-```json
-{
-  "id": 101,
-  "jsonrpc": "2.0",
-  "method": "channel::UpsertState",
-  "params": [
-    {
-      "state_key": "john@doe.com.#12345",
-      "value": "{\"last_message_id\": \"<bb7364a5-8f24-4b6a-a2d8-4658f42cd5cd-sender@example.com>\"}"
-    },
-    {
-      "state_key": "john.doe@example.com.#12346",
-      "value": "{\"last_message_id\": \"<2e9dd0b2-9555-4627-871e-c8696e742486-sender@example.com>\"}"
-    }
-  ]
-}
-```
-
-This is an example request of the `email` channel plugin, which upserts two state entries for two different email
-addresses, so that the next time a notification about the same incident is sent to the same email address, the channel
-plugin can use the `last_message_id` to set the `In-Reply-To` and `References` headers in the email, so that
-the email client can group the emails together in a thread. Such a state is not necessary for all channel plugins, but
-can be useful for some, such as email or chat channels that support threading of messages or other forms of stateful
-communication. Icinga Notifications will respond with the following JSON-RPC response to the above request:
-
-```json
-{
-  "id": 101,
-  "jsonrpc": "2.0",
-  "result": null
-}
-```
-
-And here is an example of an error response, if the channel plugin tries to upsert a state with a key that is too long:
-
-```json
-{
-  "id": 102,
-  "jsonrpc":"2.0",
-  "error": {
-    "code": -32602,
-    "message": "invalid state key, must be non-empty and at most 255 chars, \"xxxxxxx<...>\" given"
-  }
-}
-```
-
-#### DeleteState
-
-Similar to the `channel::UpsertState` method, the `channel::DeleteState` method allows channel plugins to delete
-their state from Icinga Notifications' database. The request format is quite similar to the [`channel::UpsertState`](#upsertstate)
-method except that the state entries are allowed to have only the `state_key` field set, as the `value` field is not
-needed for deletion. This means that the `value` field is optional and can be omitted entirely, as shown in the example
-request below:
-
-```json
-{
-  "id": 103,
-  "jsonrpc": "2.0",
-  "method": "channel::DeleteState",
-  "params": [
-    {
-      "state_key": "john@doe.com.#12345"
-    },
-    {
-      "state_key": "john.doe@example.com.#12346"
-    }
-  ]
-}
-```
-
-Icinga Notifications will then delete the state entries matching the provided keys and the channel plugin ID the request
-was received from, and respond with the following JSON-RPC response:
-
-```json
-{
-  "id": 103,
-  "jsonrpc": "2.0",
-  "result": null
-}
-```
-
-That way, the channel plugin can clean up its state when it is no longer needed, for example, when an incident is
-resolved and the channel plugin no longer needs to keep track of the last message sent for that incident.
-Since Icinga Notifications will always include the channel plugin ID as an additional filter when deleting state
-entries, the channel plugin does not need to worry about accidentally deleting state entries from other channel plugins
-that may have the same state key, as the combination of the channel plugin ID and the state key is guaranteed to be
-unique in the database.
-
 ### RPC Methods
 
-The following methods must be implemented by a channel.
+The following methods must be implemented by a channel plugin, and are called by Icinga Notifications to interact
+with the channel:
+
+| Method           | Description                                                                |
+|------------------|----------------------------------------------------------------------------|
+| GetInfo          | Returns meta information about the channel, such as its name, version etc. |
+| SetConfig        | Configures the channel with the provided configuration options.            |
+| SendNotification | Requests the channel to send a notification.                               |
+
+Each of these methods is described in detail below, including the expected request and response formats.
 
 #### GetInfo
 
@@ -317,6 +226,23 @@ The parameterless `GetInfo` method returns information about the channel.
 
 Its `result` is expected to be a JSON object with the `json` fields defined in the
 [`Info` type](https://pkg.go.dev/github.com/icinga/icinga-go-library/notifications/plugin#Info).
+
+| Field                      | Type   | Description                                                  |
+|----------------------------|--------|--------------------------------------------------------------|
+| name                       | String | **Required.** The display name of the channel.               |
+| version                    | String | **Required.** The version of the channel.                    |
+| author                     | String | **Required.** The author of the channel.                     |
+| supported_request_versions | Array  | **Required.** The supported request versions of the channel. |
+| config_attrs               | Array  | **Required.** The configuration options of the channel.      |
+
+Everything except `supported_request_versions` will be persisted in the database and used to configure the channel
+in Icinga Notifications Web. The `supported_request_versions` field tells Icinga Notifications which request versions
+the channel plugin supports, and is used to ensure compatibility between the channel plugin and Icinga Notifications.
+Icinga Notifications is expected to support all past request versions the channel plugin advertises, but will refuse
+versions it does not support. For example, if a channel plugin advertises support for request version 2 (doesn't exist
+yet) and Icinga Notifications knows only about request version 1, it will refuse to start the channel plugin and log
+an error message.
+
 The `config_attrs` field must be an array of JSON objects according to the
 [`ConfigOption` type](https://pkg.go.dev/github.com/icinga/icinga-go-library/notifications/plugin#ConfigOption).
 These attributes define configuration options for the channel to be set by the `SetConfig` method.
@@ -341,6 +267,7 @@ They are also used for channel configuration in Icinga Notifications Web.
     "name": "Minified Webhook",
     "version": "0.0.0-gf369a11-dirty",
     "author": "Icinga GmbH",
+    "supported_request_versions": [1],
     "config_attrs": [
       {
         "name": "url_template",
@@ -395,7 +322,7 @@ To illustrate, the URL template from the above output is configurable with the f
 
 ```json
 {
-  "url_template": "http://localhost:8000/update/{{.Incident.Id}}"
+  "url_template": "http://localhost:8000/update/{{.Object.Name}}"
 }
 ```
 
@@ -411,7 +338,7 @@ appropriate error code and message.
   "jsonrpc": "2.0",
   "method": "SetConfig",
   "params": {
-    "url_template": "http://localhost:8000/update/{{.Incident.Id}}",
+    "url_template": "http://localhost:8000/update/{{.Object.Name}}",
     "response_status_codes": "200"
   },
   "id": 2
@@ -436,9 +363,35 @@ Within the request's `params`, a JSON object representing a
 [`NotificationRequest`](https://pkg.go.dev/github.com/icinga/icinga-go-library/notifications/plugin#NotificationRequest)
 is passed.
 
+The `incident` field is only set when the notification relates to an incident. That is the case if:
+
+* the event opened or escalated an incident, or
+* the contact is notified as a recipient of the object's open incident (via an escalation, as a subscriber or as
+  the manager).
+
+Otherwise, for example for a contact that is notified only because of a notification rule, `incident` is `null`.
+Channel plugins (and templates referencing `.Incident`) must handle this `null` case explicitly.
+
+The request's `contact.addresses` only contains the contact's addresses whose type matches the channel plugin type.
+For example, the `email` channel plugin only receives addresses of type `email`. If the contact has no such address,
+the array is empty, and it's up to the channel plugin to decide how to handle such a case.
+
+If the request refers to an incident and the contact has at least one matching address, the request also contains
+a `state` object. See [Channel State](#channel-state) for how to use it.
+
 If the channel is unable to send a notification, an `error` response must be replied with the appropriate error code
 and message. This may be due to channel-specific reasons, such as an email channel where the SMTP server is unavailable,
-or if the channel is missing required configuration values.
+or if the channel is missing required configuration values. The error message is stored in the notification history,
+so it should be meaningful to the user.
+
+On success, the `result` may either be JSON `null` or a
+[`DeliveryResult`](https://pkg.go.dev/github.com/icinga/icinga-go-library/notifications/plugin#DeliveryResult)
+object with the following optional fields:
+
+| Field   | Type   | Description                                                                                                |
+|---------|--------|------------------------------------------------------------------------------------------------------------|
+| state   | Object | **Optional.** The new or updated [channel state](#channel-state) to persist for this incident and contact. |
+| details | Array  | **Optional.** [Delivery details](#delivery-details) to show in the notification history.                   |
 
 ##### Example SendNotification Request
 
@@ -447,30 +400,49 @@ or if the channel is missing required configuration values.
   "jsonrpc": "2.0",
   "method": "SendNotification",
   "params": {
-    "contact": {
-      "full_name": "icingaadmin",
-      "addresses": [
-        {
-          "type": "email",
-          "address": "icingaaadmin@example.com"
+    "version": 1,
+    "payload": {
+      "contact": {
+        "full_name": "icingaadmin",
+        "addresses": [
+          {
+            "type": "email",
+            "address": "icingaaadmin@example.com"
+          }
+        ]
+      },
+      "object": {
+        "name": "example-809!disk /",
+        "url": "http://localhost/icingaweb2/icingadb/service?name=disk%20%2F&host.name=example-809",
+        "sources": [
+          "icinga2-master"
+        ],
+        "tags": {
+          "host": "example-809",
+          "service": "disk /"
         }
-      ]
-    },
-    "object": {
-      "name": "dummy-816!random fortune",
-      "url": "http://localhost/icingaweb2/icingadb/service?name=random%20fortune&host.name=dummy-816",
-      "tags": {
-        "host": "dummy-816",
-        "service": "random fortune"
+      },
+      "incident": {
+        "severity": "critical",
+        "muted": false,
+        "recovered": false,
+        "message": "[CRITICAL] - Filesystem checks failed\n        \\_[CRITICAL] - / (ffs)\n                \\_[CRITICAL] - Free space absolute: 42 MiB (of 985 MiB)\n                \\_[CRITICAL] - Free space percentage: 4.264%\n                \\_[OK] - Inodes free: 97.4923% (151618 of 155518)|'/'=943718400B;826918502.400000;930283315.200000;0;1033648128",
+        "summary": "[CRITICAL] - Filesystem checks failed",
+        "started_at": "2024-07-12T10:40:00Z",
+        "managed": false,
+        "opened_by_source": "icinga2-master"
+      },
+      "event": {
+        "time": "2024-07-12T10:47:30.445439055Z",
+        "message": "[CRITICAL] - Filesystem checks failed\n        \\_[CRITICAL] - / (ffs)\n                \\_[CRITICAL] - Free space absolute: 42 MiB (of 985 MiB)\n                \\_[CRITICAL] - Free space percentage: 4.264%\n                \\_[OK] - Inodes free: 97.4923% (151618 of 155518)|'/'=943718400B;826918502.400000;930283315.200000;0;1033648128",
+        "summary": "[CRITICAL] - Filesystem checks failed"
+      },
+      "summary": "[example-809!disk /] Incident opened: [CRITICAL] - Filesystem checks failed",
+      "body": "A new incident has been opened by icinga2-master for example-809!disk /.\n\nSeverity: Critical\nOpened:   2024-07-12 10:40:00 +0000\nDetails:  http://localhost/icingaweb2/icingadb/service?name=disk%20%2F&host.name=example-809\n\n[CRITICAL] - Filesystem checks failed\n        \\_[CRITICAL] - / (ffs)\n                \\_[CRITICAL] - Free space absolute: 42 MiB (of 985 MiB)\n                \\_[CRITICAL] - Free space percentage: 4.264%\n                \\_[OK] - Inodes free: 97.4923% (151618 of 155518)|'/'=943718400B;826918502.400000;930283315.200000;0;1033648128",
+      "state": {
+        "state_key": "0d6a5bd1-3c1e-5f0e-9d43-6f1f6c2b7a10",
+        "value": "{\"last_message_id\": \"<bb7364a5-8f24-4b6a-a2d8-4658f42cd5cd-sender@example.com>\"}"
       }
-    },
-    "incident": {
-      "id": 1437,
-      "severity": "crit"
-    },
-    "event": {
-      "time": "2024-07-12T10:47:30.445439055Z",
-      "message": "Q:\tWhat looks like a cat, flies like a bat, brays like a donkey, and\n\tplays like a monkey?\nA:\tNothing."
     }
   },
   "id": 3
@@ -482,8 +454,75 @@ or if the channel is missing required configuration values.
 ```json
 {
   "jsonrpc": "2.0",
-  "result": null,
+  "result": {
+    "state": {
+      "state_key": "0d6a5bd1-3c1e-5f0e-9d43-6f1f6c2b7a10",
+      "value": "{\"last_message_id\": \"<2e9dd0b2-9555-4627-871e-c8696e742486-sender@example.com>\"}"
+    },
+    "details": [
+      {
+        "type": "text",
+        "label": "Message-ID",
+        "value": "<2e9dd0b2-9555-4627-871e-c8696e742486-sender@example.com>"
+      }
+    ]
+  },
   "id": 3
+}
+```
+
+!!! info
+
+    A channel that neither needs state nor has details to report can simply reply with `"result": null` instead
+    of a `DeliveryResult` object.
+
+### Delivery Details
+
+Besides its state, a channel plugin can report details about a successful delivery, such as the ID of the sent message
+or a link to the ticket created in an external system. Unlike the state, these details are never passed back to the
+plugin. They are meant for users, who can inspect them in the notification history of Icinga Notifications Web.
+
+The plugin returns them in the `details` field of its [`SendNotification`](#sendnotification) result, as an array of
+JSON objects according to the
+[`DeliveryDetail` type](https://pkg.go.dev/github.com/icinga/icinga-go-library/notifications/plugin#DeliveryDetail):
+
+| Field       | Type   | Description                                                                   |
+|-------------|--------|-------------------------------------------------------------------------------|
+| type        | String | **Required.** The type of the detail, e.g., `"text"` or `"url"`.              |
+| label       | String | **Required.** Describes the detail, e.g., `"Ticket"`.                         |
+| value       | String | **Required.** The actual value of the detail, e.g., `"#123"`.                 |
+| anchor_text | String | **Optional.** The text to display for a clickable link, if `type` is `"url"`. |
+
+In order Icinga Notifications Web to interpret the details correctly, the detail `type` must be provided.
+The supported types are:
+
+- number: The detail is a number and will be displayed as such.
+- boolean: The detail is a boolean value and will be displayed as such.
+- severity: It is a severity level and will be displayed with a corresponding color.
+- text: The detail is plain text and will be displayed as such.
+- url: The detail is a clickable link and will be displayed as such. The `value` field must be an absolute `http`
+  or `https` URL. If the optional `anchor_text` field is set, it will be used as the link text instead of the URL.
+- datetime: The detail is a date and time in ISO 8601 format and will be displayed as such.
+
+The serialized `details` must not exceed 1 MiB. Larger details are discarded with a logged warning, but the
+notification itself is still considered successful. For example, a channel creating tickets in an external system
+might return the following details, where the ticket is linked and the queue it was filed in is shown as plain text:
+
+```json
+{
+  "details": [
+    {
+      "type": "url",
+      "label": "Ticket",
+      "value": "https://rt.example.com/Ticket/Display.html?id=123",
+      "anchor_text": "#123"
+    },
+    {
+      "type": "text",
+      "label": "Queue",
+      "text": "Operations"
+    }
+  ]
 }
 ```
 
@@ -520,35 +559,43 @@ be stopped and a new one will be started.
 
 ### Channel State
 
-Channel plugins can store their state in Icinga Notifications' database using the [`channel::UpsertState`](#upsertstate)
-method. This allows channel plugins to persist their state across restarts, which can be useful for scenarios where the
-channel plugin needs to maintain information about previously sent notifications or other relevant data. The state is
-stored as key-value pairs in combination with the channel plugin's database unique identifier known only to Icinga
-Notifications. Each key-value pairs is represented by the
-[`State` type](https://pkg.go.dev/github.com/icinga/icinga-go-library/notifications/plugin#State) and contains
-the following fields:
+Some channel plugins need to remember information about previously sent notifications. For example, the `email`
+channel remembers the `Message-Id` of the last email sent for an incident so that it can set the `In-Reply-To` and
+`References` headers on subsequent emails, and mail clients group them into one thread. Likewise, the `telegram`
+channel replies to the last message sent for an incident. Icinga Notifications manages this state on behalf of
+the channel plugins and stores it in its database, so it survives plugin restarts and is shared in HA setups.
 
-| Field     | Type   | Description                                                 |
-|-----------|--------|-------------------------------------------------------------|
-| state_key | String | **Required.** The key of a specific state to upsert.        |
-| value     | String | **Required.** The value corresponding to the key to upsert. |
+A state is always bound to a single channel, incident and contact. It is represented by the
+[`State` type](https://pkg.go.dev/github.com/icinga/icinga-go-library/notifications/plugin#State):
 
-The state key must be unique for each channel plugin, meaning that two different channel plugins can have the same
-state key, but a single channel plugin cannot have two different values for the same state key. It must also be at
-least 1 character and at most 255 characters long. Likewise, the state value must be at least 1 character and at most
-4096 characters long. Any state key or value that does not meet these requirements will result in an error response
-from Icinga Notifications.
+| Field     | Type   | Description                                                            |
+|-----------|--------|------------------------------------------------------------------------|
+| state_key | String | A UUID generated by Icinga Notifications that identifies the state.    |
+| value     | String | The plugin-defined state value, empty if no state has been stored yet. |
 
-Every time Icinga Notifications calls the `SendNotification` method, it will also pass the channel plugin's
-current state as part of the [`NotificationRequest`](https://pkg.go.dev/github.com/icinga/icinga-go-library/notifications/plugin#NotificationRequest).
-So, the channel plugin doesn't need to call any additional methods to retrieve its state, as it is already provided
-with each request. This simplifies the state management in a HA setup, as both channel plugin processes will share the
-same state, and also mutate it in a consistent manner. If the channel plugin needs to insert a new state or update an
-existing one, it can call the [`channel::UpsertState`](#upsertstate) method with the new key-value pair. Otherwise, if
-the channel plugin no longer needs a specific state, it should call the [`channel::DeleteState`](#deletestate) method
-with a list of state keys to delete. If the plugin does not delete its orphaned state, it will remain in the database
-until the channel plugin is deleted via Icinga Notifications Web. Therefore, it is recommended to delete any state that
-is no longer needed to avoid cluttering the database with unused data.
+Icinga Notifications derives the state key from the channel, the incident and the contact's addresses passed to
+the plugin, so channel plugins must treat it as opaque and never generate or modify it themselves. With every
+[`SendNotification`](#sendnotification) request for an incident, Icinga Notifications passes the contact's `state`
+object to the plugin. Its `state_key` is always set, while its `value` holds the previously stored value, or is
+empty if nothing has been stored yet. Note that changing a contact's addresses of the channel plugin's type while
+an incident is ongoing results in a new state key, so the next notification arrives without a state and starts a
+new thread.
+
+To store or update the state, the channel plugin returns it in the `state` field of its `SendNotification` result,
+using the exact `state_key` it received. The `value` can be any string, such as JSON, between 1 and 4096 characters
+long. If the returned state has a different key or an invalid value, Icinga Notifications discards it and logs a
+warning, but the notification itself is still considered successful.
+
+Once an incident has recovered, Icinga Notifications deletes its state, since no further notifications will reference
+it. The final notification still receives the last stored value, so the plugin can refer to it one last time, but any
+state the plugin returns for a recovered incident is ignored.
+
+There is no `state` if the request doesn't refer to an incident or the contact has no address matching the channel
+plugin type. In that case, the plugin must not return a state either.
+
+Any remaining state is also removed when the channel is deleted, when its plugin type changes, or when the
+incident is removed by the [retention](03-Configuration.md#retention-configuration) policy. Channel plugins
+don't need to clean up after themselves.
 
 ## Writing Channel Plugins
 

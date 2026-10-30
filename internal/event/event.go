@@ -2,7 +2,6 @@ package event
 
 import (
 	"fmt"
-	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -49,20 +48,6 @@ func (e *Event) Validate() error {
 		return fmt.Errorf("invalid event: source ID must not be empty")
 	}
 
-	// The daemon doesnt know where the source's web interface lives, so it can not turn a relative
-	// reference into something a notification recipient is able to open. Sources have to send an absolute
-	// URL right away. An empty url is still okay, it just means that this object has no web interface.
-	if e.URL != "" {
-		u, err := url.Parse(e.URL)
-		if err != nil {
-			return fmt.Errorf("invalid event: url is not a valid URL: %w", err)
-		}
-
-		if !u.IsAbs() {
-			return fmt.Errorf("invalid event: url must be an absolute URL, got %q", e.URL)
-		}
-	}
-
 	return nil
 }
 
@@ -77,14 +62,17 @@ func (e *Event) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 		encoder.AddBool("muted", e.Muted.Bool)
 		encoder.AddString("muted_reason", e.MutedReason)
 	}
-	if e.OpenOrEscalate() {
-		encoder.AddBool("incident", true)
+	if e.Incident.Valid {
+		encoder.AddBool("incident", e.Incident.Bool)
 	}
 	if e.CloseIncident() {
 		encoder.AddBool("close", true)
 	}
 	if e.NotifyRecipients() {
 		encoder.AddBool("notify", true)
+	}
+	if e.NotificationOnly() {
+		encoder.AddString("event_type", e.Type)
 	}
 
 	return encoder.AddObject("tags", zapcore.ObjectMarshalerFunc(func(objectEncoder zapcore.ObjectEncoder) error {
@@ -157,7 +145,7 @@ filterColumnsLoop:
 	return result
 }
 
-func (e *Event) EvalEqual(attrs, value any) (bool, error) {
+func (e *Event) EvalEqual(attrs []string, value any) (bool, error) {
 	return slices.ContainsFunc(e.retrieveValuesFor(attrs), func(v any) bool {
 		result, err := utils.CompareAny(v, value)
 		if err != nil {
@@ -167,7 +155,7 @@ func (e *Event) EvalEqual(attrs, value any) (bool, error) {
 	}), nil
 }
 
-func (e *Event) EvalLess(attrs, value any) (bool, error) {
+func (e *Event) EvalLess(attrs []string, value any) (bool, error) {
 	return slices.ContainsFunc(e.retrieveValuesFor(attrs), func(v any) bool {
 		result, err := utils.CompareAny(v, value)
 		if err != nil {
@@ -177,7 +165,7 @@ func (e *Event) EvalLess(attrs, value any) (bool, error) {
 	}), nil
 }
 
-func (e *Event) EvalLike(attrs, value any) (bool, error) {
+func (e *Event) EvalLike(attrs []string, value any) (bool, error) {
 	// Wildcard matching can't be implemented with types other than string, so convert it to a string unconditionally.
 	rgx, err := regexp.Compile(fmt.Sprint(value))
 	if err != nil {
@@ -195,7 +183,7 @@ func (e *Event) EvalLike(attrs, value any) (bool, error) {
 	}), nil
 }
 
-func (e *Event) EvalLessOrEqual(attrs, value any) (bool, error) {
+func (e *Event) EvalLessOrEqual(attrs []string, value any) (bool, error) {
 	return slices.ContainsFunc(e.retrieveValuesFor(attrs), func(v any) bool {
 		result, err := utils.CompareAny(v, value)
 		if err != nil {
@@ -205,29 +193,26 @@ func (e *Event) EvalLessOrEqual(attrs, value any) (bool, error) {
 	}), nil
 }
 
-func (e *Event) EvalExists(attrs any) bool { return len(e.retrieveValuesFor(attrs)) > 0 }
+func (e *Event) EvalExists(attrs []string) bool { return len(e.retrieveValuesFor(attrs)) > 0 }
 
 // retrieveValuesFor retrieves the values for the given key from the Relations field of this event.
-func (e *Event) retrieveValuesFor(attrs any) jsonpath.NodeList {
+func (e *Event) retrieveValuesFor(attrs []string) jsonpath.NodeList {
 	if e.evaluatedRelations == nil {
 		e.evaluatedRelations = make(map[string]jsonpath.NodeList)
 	}
 
-	if attrs, ok := attrs.([]string); ok {
-		jpp := pool.GetJSONPathParser()
-		defer pool.PutJSONPathParser(jpp)
+	jpp := pool.GetJSONPathParser()
+	defer pool.PutJSONPathParser(jpp)
 
-		for _, attr := range attrs {
-			attr := fmt.Sprint(attr)
-			nodes, cached := e.evaluatedRelations[attr]
-			if !cached {
-				path := jpp.MustParse(utils.PrefixWithJSONPathRootSelector(attr))
-				nodes = path.Select(e.Relations)
-				e.evaluatedRelations[attr] = nodes
-			}
-			if len(nodes) > 0 {
-				return nodes
-			}
+	for _, attr := range attrs {
+		nodes, cached := e.evaluatedRelations[attr]
+		if !cached {
+			path := jpp.MustParse(utils.PrefixWithJSONPathRootSelector(attr))
+			nodes = path.Select(e.Relations)
+			e.evaluatedRelations[attr] = nodes
+		}
+		if len(nodes) > 0 {
+			return nodes
 		}
 	}
 	return nil

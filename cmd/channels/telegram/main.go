@@ -3,9 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,11 +14,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/icinga/icinga-go-library/notifications"
 	"github.com/icinga/icinga-go-library/notifications/jsonrpc"
 	"github.com/icinga/icinga-go-library/notifications/plugin"
 	"github.com/icinga/icinga-go-library/utils"
 	"github.com/icinga/icinga-notifications/internal"
+	"go.uber.org/zap/zapcore"
 )
 
 func main() {
@@ -84,10 +81,11 @@ func (ch *Telegram) GetInfo() *plugin.Info {
 	}
 
 	return &plugin.Info{
-		Name:             "Telegram",
-		Version:          internal.Version.Version,
-		Author:           "Icinga GmbH",
-		ConfigAttributes: configAttrs,
+		Name:                     "Telegram",
+		Version:                  internal.Version.Version,
+		Author:                   "Icinga GmbH",
+		SupportedRequestVersions: []plugin.RequestVersion{plugin.RequestVersionV1},
+		ConfigAttributes:         configAttrs,
 	}
 }
 
@@ -104,21 +102,21 @@ func (ch *Telegram) SetConfig(jsonStr json.RawMessage) error {
 	return nil
 }
 
-func (ch *Telegram) SendNotification(req *plugin.NotificationRequest) error {
-	var chatID string
-	for _, address := range req.Contact.Addresses {
-		if address.Type == "telegram" {
-			chatID = address.Address
-			break
-		}
-	}
-	if chatID == "" {
-		return fmt.Errorf("contact %q has no Telegram address", req.Contact.FullName)
+func (ch *Telegram) SendNotification(req *plugin.NotificationRequest) (*plugin.DeliveryResult, error) {
+	payload, err := req.PayloadAs[plugin.PayloadV1]()
+	if err != nil {
+		return nil, err
 	}
 
+	if len(payload.Contact.Addresses) == 0 {
+		return nil, fmt.Errorf("contact %q has no Telegram address", payload.Contact.FullName)
+	}
+	chatID := payload.Contact.Addresses[0].Address
+
 	var output bytes.Buffer
-	_, _ = fmt.Fprint(&output, plugin.FormatSubject(req)+"\n\n")
-	plugin.FormatMessage(&output, req)
+	_, _ = fmt.Fprintln(&output, payload.Summary)
+	_, _ = fmt.Fprintln(&output)
+	_, _ = fmt.Fprintln(&output, payload.Body)
 
 	message := struct {
 		ChatID                string           `json:"chat_id"`
@@ -129,52 +127,37 @@ func (ch *Telegram) SendNotification(req *plugin.NotificationRequest) error {
 		ChatID: chatID,
 		// Telegram limits sendMessage "text" field to 4096 characters.
 		// https://core.telegram.org/bots/api#sendmessage
-		Text:                  utils.Ellipsize(output.String(), 4096),
+		Text:                  utils.EllipsizeRunes(output.String(), 4096),
 		DisableWebPagePreview: true,
 	}
 
 	// When this chat has already been notified about this incident, reply to the last message sent for it.
-	stateKey := makeStateKey(chatID, req.Incident)
-	var knownThread bool
-
-	for _, s := range req.States {
-		if stateKey == "" || s.Key != stateKey {
-			continue
-		}
-
+	if payload.State.Value != "" {
 		var st state
-		if err := json.Unmarshal([]byte(s.Value), &st); err != nil {
-			return fmt.Errorf("cannot unmarshal channel state %q: %w", s.Key, err)
+		if err := json.Unmarshal([]byte(payload.State.Value), &st); err != nil {
+			ch.notifyLog(zapcore.WarnLevel, "Failed to unmarshal channel state",
+				"state_key", payload.State.Key, "state_value", payload.State.Value, "error", err)
+		} else {
+			message.ReplyParameters = &replyParameters{MessageID: st.MessageID, AllowSendingWithoutReply: true}
 		}
-		knownThread = true
-		message.ReplyParameters = &replyParameters{MessageID: st.MessageID, AllowSendingWithoutReply: true}
-		break
 	}
 
 	messageID, err := ch.sendMessage(message)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if req.Incident == nil || stateKey == "" {
-		return nil
-	}
-
-	if req.Incident.IsRecovered && knownThread {
-		// The thread is done, no further notifications will reference it.
-		states := []plugin.State{{Key: stateKey}}
-		if err := ch.rpcEp.Call(ch.rpcCtx, notifications.MethodDeleteState, states, nil); err != nil {
-			slog.ErrorContext(ch.rpcCtx, "Failed to delete channel state", "error", err)
-		}
-	} else if !req.Incident.IsRecovered {
+	if payload.Incident != nil && !payload.Incident.IsRecovered {
 		// Remember this message so that the next notification for this incident replies to it.
-		states := []plugin.State{{Key: stateKey, Value: state{MessageID: messageID}.String()}}
-		if err := ch.rpcEp.Call(ch.rpcCtx, notifications.MethodUpsertState, states, nil); err != nil {
-			slog.ErrorContext(ch.rpcCtx, "Failed to upsert channel state", "error", err)
-		}
+		return &plugin.DeliveryResult{
+			State: plugin.State{
+				Key:   payload.State.Key,
+				Value: state{MessageID: messageID}.String(),
+			},
+		}, nil
 	}
 
-	return nil
+	return nil, nil
 }
 
 // sendMessage posts the given message to the Telegram bot API and returns the message id.
@@ -219,6 +202,17 @@ func (ch *Telegram) sendMessage(message any) (int64, error) {
 	return response.Result.MessageID, nil
 }
 
+// notifyLog logs a message to the notification log, if the RPC endpoint is available.
+func (ch *Telegram) notifyLog(lvl zapcore.Level, msg string, fields ...any) {
+	if ch.rpcCtx == nil || ch.rpcEp == nil {
+		slog.Error("RPC endpoint not available, cannot log notification message", "message", msg)
+		return
+	}
+	if err := ch.rpcEp.NotifyLog(ch.rpcCtx, lvl, msg, fields...); err != nil {
+		slog.ErrorContext(ch.rpcCtx, "Failed to log notification message", "error", err)
+	}
+}
+
 // redactToken removes the bot token from the request URL an url.Error carries, as this error would leak
 // the token into the daemons log:
 // https://github.com/golang/go/issues/44819
@@ -228,21 +222,6 @@ func redactToken(err error, token string) error {
 		urlErr.URL = strings.ReplaceAll(urlErr.URL, token, "<redacted>")
 	}
 	return err
-}
-
-// makeStateKey composes a unique key for the channel state based on the recipients chat ID and the incident ID.
-func makeStateKey(chatID string, i *plugin.Incident) string {
-	if i == nil {
-		return ""
-	}
-	h := sha256.New()
-	if err := binary.Write(h, binary.BigEndian, i.Id); err != nil {
-		return ""
-	}
-	if err := binary.Write(h, binary.BigEndian, []byte(chatID)); err != nil {
-		return ""
-	}
-	return hex.EncodeToString(h.Sum(nil))
 }
 
 func drainAndClose(r io.ReadCloser) {

@@ -1,7 +1,6 @@
 package rule
 
 import (
-	"encoding/json"
 	"errors"
 	"time"
 
@@ -13,6 +12,23 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+// Type represents the type of rule, either a notification or an escalation.
+type Type string
+
+// String returns the string representation of the rule type.
+func (t Type) String() string {
+	return string(t)
+}
+
+// Every rule must have exactly one type of the following values.
+const (
+	// TypeNotification rules are evaluated for events with incident=false and notify their recipients immediately,
+	// without opening or escalating an incident.
+	TypeNotification Type = "notification"
+	// TypeEscalation is used for rules that are triggered when an incident is opened or escalated.
+	TypeEscalation Type = "escalation"
+)
+
 type Rule struct {
 	baseconf.IncrementalPkDbEntry[int64] `db:",inline"`
 
@@ -22,7 +38,8 @@ type Rule struct {
 	ObjectFilter     filter.Filter          `db:"-"`
 	ObjectFilterExpr types.String           `db:"object_filter"`
 	SourceType       string                 `db:"source_type"`
-	Escalations      map[int64]*Escalation  `db:"-"`
+	Type             Type                   `db:"type"`
+	Entries          map[int64]*Entry       `db:"-"`
 
 	// FilterColumns is a set of all filter columns used in the rule's ObjectFilter.
 	//
@@ -36,17 +53,12 @@ type FilterAttrsType [][]string
 
 // IncrementalInitAndValidate implements the config.IncrementalConfigurableInitAndValidatable interface.
 func (r *Rule) IncrementalInitAndValidate() error {
-	if r.ObjectFilterExpr.Valid {
-		data := map[string]json.RawMessage{}
-		if err := json.Unmarshal([]byte(r.ObjectFilterExpr.String), &data); err != nil {
-			return err
-		}
-		filterBytes, exists := data["ast"]
-		if !exists {
-			return errors.New("missing 'ast' field in object filter expression")
-		}
+	if r.Type != TypeNotification && r.Type != TypeEscalation {
+		return errors.New("invalid rule type: " + r.Type.String())
+	}
 
-		f, err := filter.UnmarshalJSON(filterBytes)
+	if r.ObjectFilterExpr.Valid {
+		f, err := filter.ParseASTExpr(r.ObjectFilterExpr.String)
 		if err != nil {
 			return err
 		}
@@ -54,9 +66,7 @@ func (r *Rule) IncrementalInitAndValidate() error {
 		r.ObjectFilter = f
 		if f != nil {
 			for _, condition := range f.ExtractConditions() {
-				if attrs, ok := condition.Attributes().([]string); ok {
-					r.FilterColumns = append(r.FilterColumns, attrs)
-				}
+				r.FilterColumns = append(r.FilterColumns, condition.Attributes())
 			}
 		}
 	}
@@ -68,9 +78,13 @@ func (r *Rule) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	encoder.AddInt64("id", r.ID)
 	encoder.AddString("name", r.Name)
 	encoder.AddString("source_type", r.SourceType)
+	encoder.AddString("rule_type", r.Type.String())
 
 	if r.TimePeriodID.Valid && r.TimePeriodID.Int64 != 0 {
 		encoder.AddInt64("timeperiod_id", r.TimePeriodID.Int64)
+	}
+	if r.ObjectFilter != nil {
+		encoder.AddString("object_filter", r.ObjectFilter.String())
 	}
 
 	return nil
@@ -86,39 +100,89 @@ func (r *Rule) Eval(filterable filter.Filterable) (bool, error) {
 	return r.ObjectFilter.Eval(filterable)
 }
 
-// ContactChannels stores a set of channel IDs for each set of individual contacts.
-type ContactChannels map[*recipient.Contact]map[int64]bool
+// ChannelOrigin identifies the entry recipient through which a contact's channel was selected.
+//
+// A zero value denotes a contact that was added without any rule involvement,
+// e.g. a recipient that subscribed to or manages an incident via the UI.
+type ChannelOrigin struct {
+	ChannelID      int64
+	RuleID         int64 // Zero if the contact subscribed via web-gui
+	RuleEntryID    int64 // Zero if the contact subscribed via web-gui
+	ContactGroupID int64 // Non-zero if the contact was resolved from a contact group.
+	ScheduleID     int64 // Non-zero if the contact was resolved from a schedule.
+	Role           recipient.Role
 
-// LoadFromEscalationRecipients loads recipients channel of the specified escalation to the current map.
-// You can provide this method a callback to control whether the channel of a specific contact should
-// be loaded, and it will skip those for whom the callback returns false. Pass AlwaysNotifiable for default actions.
-func (ch ContactChannels) LoadFromEscalationRecipients(escalation *Escalation, t time.Time, isNotifiable func(recipient.Key) bool) {
-	for _, escalationRecipient := range escalation.Recipients {
-		ch.LoadRecipientChannel(escalationRecipient, t, isNotifiable)
+	// IncidentRelated is true if the contact is notified as a recipient of the incident (escalation recipient,
+	// subscriber, manager) rather than through a notification rule.
+	IncidentRelated bool
+
+	// BypassSuppression marks an origin that may be notified even though the incident is muted.
+	//
+	// It is set for recipient+channel pairs of a newly triggered escalation that are not yet known to the incident.
+	BypassSuppression bool
+}
+
+// RecipientKey returns the key of the recipient based on its origin.
+func (o ChannelOrigin) RecipientKey(contact *recipient.Contact) recipient.Key {
+	switch {
+	case o.ContactGroupID != 0:
+		return recipient.Key{GroupID: types.MakeInt(o.ContactGroupID)}
+	case o.ScheduleID != 0:
+		return recipient.Key{ScheduleID: types.MakeInt(o.ScheduleID)}
+	default:
+		return recipient.ToKey(contact)
 	}
 }
 
-// LoadRecipientChannel loads recipient channel to the current map.
-// You can provide this method a callback to control whether the channel of a specific contact should
-// be loaded, and it will skip those for whom the callback returns false. Pass AlwaysNotifiable for default actions.
-func (ch ContactChannels) LoadRecipientChannel(er *EscalationRecipient, t time.Time, isNotifiable func(recipient.Key) bool) {
-	if isNotifiable(er.Key) {
-		for _, c := range er.Recipient.GetContactsAt(t) {
-			if ch[c] == nil {
-				ch[c] = make(map[int64]bool)
+type (
+	// ContactChannels stores, per contact and channel ID, the origins that selected this channel.
+	//
+	// When multiple entry recipients resolve to the same contact and channel, all their origins are
+	// recorded: the first origin is the one the notification is attributed to, any further ones denote
+	// duplicates that would have notified the same contact via the same channel.
+	ContactChannels map[*recipient.Contact][]ChannelOrigin
+
+	// IsNotifiableFn is a callback function type that determines whether a specific recipient
+	// should be considered for notification.
+	IsNotifiableFn func(recipient.Key) bool
+
+	// LoadRecipientOption is a functional option type that allows customization of the ChannelOrigin
+	// when loading recipient channels.
+	LoadRecipientOption func(*EntryRecipient, *ChannelOrigin)
+)
+
+// LoadFromEntryRecipients adds the channels of all contacts resolved from entry's recipients at time t.
+//
+// The isNotifiable callback is used to filter out recipients that should not be notified. Additionally,
+// LoadRecipientOption opts can be provided to customize the ChannelOrigin for each loaded recipient channel.
+func (ch ContactChannels) LoadFromEntryRecipients(entry *Entry, t time.Time, isNotifiable IsNotifiableFn, opts ...LoadRecipientOption) {
+	for _, r := range entry.Recipients {
+		if isNotifiable(r.Key) {
+			origin := ChannelOrigin{
+				RuleID:         entry.RuleID,
+				RuleEntryID:    r.EntryID,
+				ContactGroupID: r.GroupID.Int64,
+				ScheduleID:     r.ScheduleID.Int64,
+				Role:           recipient.RoleRecipient,
 			}
-			if er.ChannelID.Valid {
-				ch[c][er.ChannelID.Int64] = true
-			} else {
-				ch[c][c.DefaultChannelID] = true
+
+			for _, opt := range opts {
+				opt(r, &origin)
+			}
+
+			for _, c := range r.Recipient.GetContactsAt(t) {
+				if r.ChannelID.Valid {
+					origin.ChannelID = r.ChannelID.Int64
+				} else {
+					origin.ChannelID = c.DefaultChannelID
+				}
+				ch[c] = append(ch[c], origin)
 			}
 		}
 	}
 }
 
-// AlwaysNotifiable (checks) whether the given recipient is notifiable and returns always true.
-// This function is usually passed as an argument to ContactChannels.LoadFromEscalationRecipients whenever you do
-// not want to perform any custom actions.
-func AlwaysNotifiable(_ recipient.Key) bool {
-	return true
+// WithIncidentRelated returns a LoadRecipientOption that sets the IncidentRelated flag on the ChannelOrigin.
+func WithIncidentRelated() LoadRecipientOption {
+	return func(_ *EntryRecipient, o *ChannelOrigin) { o.IncidentRelated = true }
 }

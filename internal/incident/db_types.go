@@ -15,8 +15,9 @@ type ContactRow struct {
 	ID            int64 `db:"id"`
 	IncidentID    int64 `db:"incident_id"`
 	recipient.Key `db:",inline"`
-	Role          ContactRole     `db:"role"`
-	ChangedAt     types.UnixMilli `db:"changed_at"`
+	Role          recipient.Role   `db:"role"`
+	EventTypes    types.StringList `db:"event_types"`
+	ChangedAt     types.UnixMilli  `db:"changed_at"`
 }
 
 // TableName implements the contracts.TableNamer interface.
@@ -25,10 +26,11 @@ func (c *ContactRow) TableName() string {
 }
 
 // Upsert implements the contracts.Upserter interface.
-func (c *ContactRow) Upsert() interface{} {
+func (c *ContactRow) Upsert() any {
 	return &struct {
-		Role      ContactRole     `db:"role"`
-		ChangedAt types.UnixMilli `db:"changed_at"`
+		Role       recipient.Role   `db:"role"`
+		EventTypes types.StringList `db:"event_types"`
+		ChangedAt  types.UnixMilli  `db:"changed_at"`
 	}{}
 }
 
@@ -58,9 +60,10 @@ func (r *RuleRow) TableName() string {
 
 // HistoryRow represents a single incident history database entry.
 type HistoryRow struct {
-	ID                int64     `db:"id"`
-	IncidentID        int64     `db:"incident_id"`
-	RuleEscalationID  types.Int `db:"rule_escalation_id"`
+	ID                int64      `db:"id"`
+	IncidentID        int64      `db:"incident_id"`
+	EventID           types.UUID `db:"event_id"`
+	RuleEntryID       types.Int  `db:"rule_entry_id"`
 	recipient.Key     `db:",inline"`
 	RuleID            types.Int         `db:"rule_id"`
 	Time              types.UnixMilli   `db:"time"`
@@ -68,8 +71,8 @@ type HistoryRow struct {
 	ChannelID         types.Int         `db:"channel_id"`
 	NewSeverity       event.Severity    `db:"new_severity"`
 	OldSeverity       event.Severity    `db:"old_severity"`
-	NewRecipientRole  ContactRole       `db:"new_recipient_role"`
-	OldRecipientRole  ContactRole       `db:"old_recipient_role"`
+	NewRecipientRole  recipient.Role    `db:"new_recipient_role"`
+	OldRecipientRole  recipient.Role    `db:"old_recipient_role"`
 	Message           types.String      `db:"message"`
 	NotificationState NotificationState `db:"notification_state"`
 	SentAt            types.UnixMilli   `db:"sent_at"`
@@ -105,6 +108,15 @@ type NotificationEntry struct {
 	ChannelID    int64             `db:"-"`
 	State        NotificationState `db:"notification_state"`
 	SentAt       types.UnixMilli   `db:"sent_at"`
+
+	Reason notifyReason `db:"-"`
+
+	HistoryEntry          NotificationHistory          `db:"-"`
+	SkippedHistoryEntries []SkippedNotificationHistory `db:"-"`
+	// IsIncidentRelated marks notifications that belong to the incident.
+	//
+	// Only these have an incident_history row (HistoryRowID) and pass the incident to the channel.
+	IsIncidentRelated bool `db:"-"`
 }
 
 // TableName implements the contracts.TableNamer interface.

@@ -8,13 +8,10 @@ import (
 
 	"github.com/icinga/icinga-go-library/database"
 	"github.com/icinga/icinga-go-library/logging"
-	baseEv "github.com/icinga/icinga-go-library/notifications/event"
 	"github.com/icinga/icinga-go-library/types"
 	"github.com/icinga/icinga-notifications/internal/config"
 	"github.com/icinga/icinga-notifications/internal/event"
 	"github.com/icinga/icinga-notifications/internal/object"
-	"github.com/jmoiron/sqlx"
-	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
 
@@ -34,8 +31,8 @@ func ReevaluateEscalations(
 	var errs []error
 	for pair := range pairCh {
 		err := pair.Incident.RetriggerEscalations(ctx, pair.Object, &event.Event{
-			Time:  time.Now(),
-			Event: baseEv.Event{Incident: types.MakeBool(true)},
+			Time:     time.Now(),
+			Incident: types.MakeBool(true),
 		})
 		if err != nil {
 			errs = append(errs, fmt.Errorf("cannot reevaluate incident %s escalations: %w", pair.Incident, err))
@@ -47,18 +44,23 @@ func ReevaluateEscalations(
 	return stderrors.Join(errs...)
 }
 
-// ErrOpenIncidentWithoutSeverity is returned when an event tries to open a new incident without a severity.
-var ErrOpenIncidentWithoutSeverity = errors.New("cannot open or escalate an incident without a severity")
-
-// ProcessEvent from an event.Event.
+// Process processes an [event.Event] or [event.QuickAction] and updates the incident state accordingly.
 //
-// It might return [ErrOpenIncidentWithoutSeverity] if the event is trying to open an incident without a severity or
-// [ErrSeverityChangeWithoutIncidentFlag] if the event is trying to change the severity of an incident without the
-// incident flag set. In both cases, the listener should map these errors to a 400 Bad Request response to the source.
-func ProcessEvent(ctx context.Context, db *database.DB, l *logging.Logging, rc *config.RuntimeConfig, ev *event.Event) error {
+// If [event.Event] is provided, it might return [ErrOpenIncidentWithoutSeverity] if the event is trying to open
+// an incident without a severity or [ErrSeverityChangeWithoutIncidentFlag] if the event is trying to change the
+// severity of an incident without the incident flag set. In both cases, the listener should map these errors to
+// a 400 Bad Request response to the source.
+func Process[T event.Event | event.QuickAction](ctx context.Context, db *database.DB, l *logging.Logging, rc *config.RuntimeConfig, req *T) error {
 	i := new(Incident)
 	i.initializeFields(db, rc, l.GetChildLogger("incident").SugaredLogger)
-	return i.ProcessEvent(ctx, ev)
+	switch evOrQA := any(req).(type) {
+	case *event.Event:
+		return i.ProcessEvent(ctx, evOrQA)
+	case *event.QuickAction:
+		return i.DoQuickAction(ctx, evOrQA)
+	}
+
+	panic("unreachable")
 }
 
 // Pair is a struct that holds an incident and its related object used for yielding incidents and objects together.
@@ -122,11 +124,9 @@ func yield(
 				errCh <- fmt.Errorf("cannot load object for incident %s: %w", i, err)
 				return
 			}
-			i.initializeFields(db, rc, logger.With(zap.String("incident", i.String()), zap.String("object", obj.DisplayName())))
+			i.initializeFields(db, rc, logger.With(zap.String("incident", i.String()), zap.String("object", obj.Name)))
 			if restoreAll {
-				if err := db.ExecTx(ctx, nil, func(ctx context.Context, tx *sqlx.Tx) error {
-					return i.restoreRelatedState(ctx, tx)
-				}); err != nil {
+				if err := i.restoreRelatedState(ctx, db); err != nil {
 					errCh <- fmt.Errorf("cannot restore related state for incident %s: %w", i, err)
 					return
 				}

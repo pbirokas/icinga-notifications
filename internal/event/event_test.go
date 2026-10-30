@@ -3,10 +3,7 @@ package event
 import (
 	"encoding/json"
 	"testing"
-	"time"
 
-	baseEv "github.com/icinga/icinga-go-library/notifications/event"
-	"github.com/icinga/icinga-go-library/types"
 	"github.com/icinga/icinga-notifications/internal/filter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,62 +12,20 @@ import (
 func TestEvent(t *testing.T) {
 	t.Parallel()
 
-	t.Run("ValidateURL", func(t *testing.T) {
-		t.Parallel()
-
-		testCases := []struct {
-			name     string
-			eventURL string
-			isValid  bool
-		}{
-			{name: "Absolute URL", eventURL: "https://example.org/path/123", isValid: true},
-			{name: "Absolute URL Of Unknown Scheme", eventURL: "icinga://example.org/path/123", isValid: true},
-			{name: "Empty URL", eventURL: "", isValid: true},
-			{name: "Relative URL With Leading Slash", eventURL: "/icingadb/host?name=testhost", isValid: false},
-			{name: "Relative URL Without Leading Slash", eventURL: "icingadb/host?name=testhost", isValid: false},
-			{name: "Protocol Relative URL", eventURL: "//example.org/path/123", isValid: false},
-			{name: "Invalid URL", eventURL: "http://[invalid-url", isValid: false},
-		}
-
-		for _, tc := range testCases {
-			t.Run(tc.name, func(t *testing.T) {
-				t.Parallel()
-
-				ev := &Event{
-					Time:     time.Now(),
-					SourceId: 1,
-					Event: baseEv.Event{
-						URL:      tc.eventURL,
-						Tags:     map[string]string{"host": "testhost"},
-						Incident: types.MakeBool(true),
-					},
-				}
-
-				if tc.isValid {
-					assert.NoError(t, ev.Validate())
-				} else {
-					assert.Error(t, ev.Validate())
-				}
-			})
-		}
-	})
-
 	t.Run("ExtractMissingRelations", func(t *testing.T) {
 		t.Parallel()
 
 		ev := &Event{
-			Event: baseEv.Event{
-				CompleteRelations: []string{"host.vars", "host", "services"},
-				Relations: map[string]any{
-					"host.vars": map[string]any{
-						"os": "Linux",
-					},
-					"services": []any{
-						map[string]any{
-							"name": "service",
-							"vars": map[string]any{
-								"department": "IT",
-							},
+			CompleteRelations: []string{"host.vars", "host", "services"},
+			Relations: map[string]any{
+				"host.vars": map[string]any{
+					"os": "Linux",
+				},
+				"services": []any{
+					map[string]any{
+						"name": "service",
+						"vars": map[string]any{
+							"department": "IT",
 						},
 					},
 				},
@@ -93,32 +48,30 @@ func TestEvent(t *testing.T) {
 		t.Parallel()
 
 		ev := &Event{
-			Event: baseEv.Event{
-				Relations: map[string]any{
-					"host": map[string]any{
-						"name": "test-host",
-						"vars": map[string]any{
-							"dict": map[string]any{
-								"key":       "value",
-								"key_int":   42,
-								"key_float": 3.1415,
-								"domain":    "example.com",
-								"key_array": []any{
-									"value1",
-									"value2",
-									map[string]any{
-										"dict_in_array": "dict_in_array1",
-									},
+			Relations: map[string]any{
+				"host": map[string]any{
+					"name": "test-host",
+					"vars": map[string]any{
+						"dict": map[string]any{
+							"key":       "value",
+							"key_int":   42,
+							"key_float": 3.1415,
+							"domain":    "example.com",
+							"key_array": []any{
+								"value1",
+								"value2",
+								map[string]any{
+									"dict_in_array": "dict_in_array1",
 								},
 							},
-							"array": []any{
-								"value1-from-array",
-								map[string]any{
-									"dict_in_array": "dict_in_array2",
-								},
-								map[string]any{
-									"dict_in_array": "dict_in_array3",
-								},
+						},
+						"array": []any{
+							"value1-from-array",
+							map[string]any{
+								"dict_in_array": "dict_in_array2",
+							},
+							map[string]any{
+								"dict_in_array": "dict_in_array3",
 							},
 						},
 					},

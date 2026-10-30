@@ -1,34 +1,27 @@
+//go:generate go tool stringer -linecomment -type NotificationState -output notification_state_string.go
+
 package incident
 
 import (
 	"database/sql/driver"
+	"encoding/json"
 	"fmt"
 )
 
-type NotificationState int
+// NotificationState represents the state of a notification in Icinga notifications.
+// It is an integer type with predefined constants for different notification states.
+type NotificationState uint8
 
 const (
 	NotificationStateNull NotificationState = iota
-	NotificationStateSuppressed
-	NotificationStatePending
-	NotificationStateSent
-	NotificationStateFailed
+
+	NotificationStateSuppressed // suppressed
+	NotificationStatePending    // pending
+	NotificationStateSent       // sent
+	NotificationStateFailed     // failed
+
+	notificationStateMax // internal
 )
-
-var notificationStatTypeByName = map[string]NotificationState{
-	"suppressed": NotificationStateSuppressed,
-	"pending":    NotificationStatePending,
-	"sent":       NotificationStateSent,
-	"failed":     NotificationStateFailed,
-}
-
-var notificationStateTypeToName = func() map[NotificationState]string {
-	stateTypes := make(map[NotificationState]string)
-	for name, eventType := range notificationStatTypeByName {
-		stateTypes[eventType] = name
-	}
-	return stateTypes
-}()
 
 // Scan implements the sql.Scanner interface.
 // Supports SQL NULL.
@@ -48,16 +41,18 @@ func (n *NotificationState) Scan(src any) error {
 		return fmt.Errorf("unable to scan type %T into NotificationState", src)
 	}
 
-	historyType, ok := notificationStatTypeByName[name]
-	if !ok {
-		return fmt.Errorf("unknown notification state type %q", name)
+	state, err := ParseNotificationState(name)
+	if err != nil {
+		return err
 	}
 
-	*n = historyType
+	*n = state
 
 	return nil
 }
 
+// Value implements the driver.Valuer interface.
+// Supports SQL NULL.
 func (n NotificationState) Value() (driver.Value, error) {
 	if n == NotificationStateNull {
 		return nil, nil
@@ -66,6 +61,43 @@ func (n NotificationState) Value() (driver.Value, error) {
 	return n.String(), nil
 }
 
-func (n *NotificationState) String() string {
-	return notificationStateTypeToName[*n]
+// UnmarshalJSON implements the [json.Unmarshaler] interface for NotificationState.
+func (n *NotificationState) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*n = NotificationStateNull
+		return nil
+	}
+
+	var name string
+	if err := json.Unmarshal(data, &name); err != nil {
+		return err
+	}
+
+	state, err := ParseNotificationState(name)
+	if err != nil {
+		return err
+	}
+
+	*n = state
+	return nil
+}
+
+// MarshalJSON implements the [json.Marshaler] interface for NotificationState.
+func (n NotificationState) MarshalJSON() ([]byte, error) {
+	if n != NotificationStateNull {
+		return json.Marshal(n.String())
+	}
+	return json.Marshal(nil)
+}
+
+// ParseNotificationState parses a string representation of a notification state and returns the corresponding NotificationState value.
+// If the string does not match any known notification state, it returns an error indicating the unknown notification state.
+func ParseNotificationState(name string) (NotificationState, error) {
+	for s := range notificationStateMax {
+		if s != NotificationStateNull && s.String() == name {
+			return s, nil
+		}
+	}
+
+	return NotificationStateNull, fmt.Errorf("unknown notification state %q", name)
 }
